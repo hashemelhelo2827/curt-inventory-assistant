@@ -167,7 +167,7 @@ async def _get_tools_cached():
 
             "DATABASE_TOOLS": {
 
-                "command": "python",
+                "command": sys.executable,
 
                 "args": [
                     os.path.abspath(
