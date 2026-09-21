@@ -152,6 +152,35 @@ def get_model_rotated():
 # Initial model
 model = get_model()
 
+# ============================================================
+# GLOBAL MCP CLIENT - single stdio subprocess for all Chatbot calls
+# Avoids TaskGroup per-turn creation/close race
+# ============================================================
+
+_global_mcp_client = None
+_global_tools_cache = None
+
+async def _get_tools_cached():
+    global _global_mcp_client, _global_tools_cache
+    if _global_tools_cache is None:
+        _global_mcp_client = MultiServerMCPClient({
+
+            "DATABASE_TOOLS": {
+
+                "command": "python",
+
+                "args": [
+                    os.path.abspath(
+                        "agent/tools/databaseserver/databasetools.py"
+                    )
+                ],
+
+                "transport": "stdio"
+            }
+        })
+        _global_tools_cache = await _global_mcp_client.get_tools()
+    return _global_tools_cache
+
 
 # ============================================================
 # OUTPUT SCHEMA
@@ -272,154 +301,127 @@ async def Chatbot(
 ):
 
     # --------------------------------------------------------
-    # MCP DATABASE CLIENT
+    # MCP DATABASE CLIENT - global cached (single TaskGroup)
     # --------------------------------------------------------
 
-    client = MultiServerMCPClient({
-
-        "DATABASE_TOOLS": {
-
-            "command": "python",
-
-            "args": [
-                os.path.abspath(
-                    "agent/tools/databaseserver/databasetools.py"
-                )
-            ],
-
-            "transport": "stdio"
-        }
-    })
+    tools = await _get_tools_cached()
 
 
-    try:
-        # Get database tools
-        tools = await client.get_tools()
+    # --------------------------------------------------------
+    # OUTPUT PARSER
+    # --------------------------------------------------------
+
+    parser = JsonOutputParser(
+        pydantic_object=ANSWER
+    )
+
+    format_instructions = ANSWER.format_instructions()
 
 
-        # --------------------------------------------------------
-        # OUTPUT PARSER
-        # --------------------------------------------------------
+    # --------------------------------------------------------
+    # TRY MODELS - fresh model per request to match backend global loop
+    # --------------------------------------------------------
 
-        parser = JsonOutputParser(
-            pydantic_object=ANSWER
+    current_model = get_model()
+
+    for attempt in range(len(MODELS)):
+
+        # Create agent using current model
+        agent = create_react_agent(
+
+            model=current_model,
+
+            tools=tools,
+
+            prompt=SYSTEM_PROMPT.format(
+                format_instructions=format_instructions
+            )
         )
 
-        format_instructions = ANSWER.format_instructions()
+
+        try:
+
+            # ------------------------------------------------
+            # BUILD MESSAGES
+            # ------------------------------------------------
+
+            messages = conversation_history[-MAX_HISTORY:]
+
+            messages.append({
+                "role": "user",
+                "content": user_input
+            })
 
 
-        # --------------------------------------------------------
-        # TRY MODELS - fresh model per request to match backend global loop
-        # --------------------------------------------------------
+            # ------------------------------------------------
+            # RUN AGENT
+            # ------------------------------------------------
 
-        current_model = get_model()
-
-        for attempt in range(len(MODELS)):
-
-            # Create agent using current model
-            agent = create_react_agent(
-
-                model=current_model,
-
-                tools=tools,
-
-                prompt=SYSTEM_PROMPT.format(
-                    format_instructions=format_instructions
-                )
+            response = await agent.ainvoke(
+                {"messages": messages},
+                config={"recursion_limit": 8},
             )
 
 
-            try:
+            # ------------------------------------------------
+            # GET ASSISTANT RESPONSE
+            # ------------------------------------------------
 
-                # ------------------------------------------------
-                # BUILD MESSAGES
-                # ------------------------------------------------
-
-                messages = conversation_history[-MAX_HISTORY:]
-
-                messages.append({
-                    "role": "user",
-                    "content": user_input
-                })
+            assistant_message = (
+                response["messages"][-1].content
+            )
 
 
-                # ------------------------------------------------
-                # RUN AGENT
-                # ------------------------------------------------
+            # ------------------------------------------------
+            # SAVE HISTORY
+            # ------------------------------------------------
 
-                response = await agent.ainvoke(
-                    {"messages": messages},
-                    config={"recursion_limit": 8},
+            conversation_history.append({
+                "role": "user",
+                "content": user_input
+            })
+
+            conversation_history.append({
+                "role": "assistant",
+                "content": assistant_message
+            })
+
+
+            # ------------------------------------------------
+            # RETURN
+            # ------------------------------------------------
+
+            return (
+                assistant_message,
+                conversation_history
+            )
+
+
+        except Exception as e:
+
+            # ------------------------------------------------
+            # RATE LIMIT → ROTATE MODEL
+            # ------------------------------------------------
+
+            if _is_rate_limit(e):
+
+                print(
+                    f"Rate limit hit. "
+                    f"Rotating model "
+                    f"({attempt + 1}/{len(MODELS)})..."
                 )
 
+                current_model = get_model_rotated()
 
-                # ------------------------------------------------
-                # GET ASSISTANT RESPONSE
-                # ------------------------------------------------
+            else:
 
-                assistant_message = (
-                    response["messages"][-1].content
-                )
-
-
-                # ------------------------------------------------
-                # SAVE HISTORY
-                # ------------------------------------------------
-
-                conversation_history.append({
-                    "role": "user",
-                    "content": user_input
-                })
-
-                conversation_history.append({
-                    "role": "assistant",
-                    "content": assistant_message
-                })
+                # Other errors should not silently
+                # switch models.
+                raise
 
 
-                # ------------------------------------------------
-                # RETURN
-                # ------------------------------------------------
-
-                return (
-                    assistant_message,
-                    conversation_history
-                )
-
-
-            except Exception as e:
-
-                # ------------------------------------------------
-                # RATE LIMIT → ROTATE MODEL
-                # ------------------------------------------------
-
-                if _is_rate_limit(e):
-
-                    print(
-                        f"Rate limit hit. "
-                        f"Rotating model "
-                        f"({attempt + 1}/{len(MODELS)})..."
-                    )
-
-                    current_model = get_model_rotated()
-
-                else:
-
-                    # Other errors should not silently
-                    # switch models.
-                    raise
-
-
-        # --------------------------------------------------------
-        # ALL MODELS FAILED
-        # --------------------------------------------------------
+    # --------------------------------------------------------
+    # ALL MODELS FAILED
+    # --------------------------------------------------------
 
         raise Exception("All models exhausted!")
-    finally:
-        try:
-            if hasattr(client, "close"):
-                await client.close()
-            elif hasattr(client, "aclose"):
-                await client.aclose()
-        except:
-            pass
