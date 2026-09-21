@@ -20,7 +20,7 @@ except:
 
 import requests
 
-# Global event loop for Phase2 (like backend/app.py:19 - avoids 'Event loop is closed' with httpx/anyio)
+# Global loop for Phase2 - reuses same loop to avoid httpx Event loop is closed, with TaskGroup fix via client.close() in agent/model.py
 _loop = asyncio.new_event_loop()
 asyncio.set_event_loop(_loop)
 
@@ -338,7 +338,7 @@ if prompt:
                     # Try direct import (faster, no network)
                     if HAS_DIRECT_PHASE2:
                         try:
-                            # Use global loop (like backend/app.py:19) - avoids Event loop is closed
+                            # Reuse global loop (avoids httpx Event loop is closed) - TaskGroup now cleaned via client.close()
                             resp, new_hist = _loop.run_until_complete(
                                 phase2_chatbot(prompt, st.session_state.conversation_history)
                             )

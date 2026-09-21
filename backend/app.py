@@ -14,7 +14,7 @@ app.config["SESSION_TYPE"] = "filesystem"
 
 Session(app)
 
-# Global event loop for Chatbot (avoids 'Event loop is closed' with httpx/anyio on Windows)
+# Global loop for Chatbot - reuses same loop to avoid httpx Event loop is closed, with TaskGroup fix via client.close()
 _loop = asyncio.new_event_loop()
 asyncio.set_event_loop(_loop)
 
