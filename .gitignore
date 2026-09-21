@@ -1,0 +1,15 @@
+.env
+.env.local
+venv/
+__pycache__/
+*.pyc
+*.pyo
+phase1/__pycache__/
+agent/tools/databaseserver/__pycache__/
+.streamlit/secrets.toml
+flask_session/
+database/*.db-journal
+.DS_Store
+.venv/
+venv/
+*.log
