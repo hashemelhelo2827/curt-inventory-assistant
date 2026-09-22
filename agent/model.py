@@ -82,7 +82,7 @@ def get_model():
                 model=m["name"],
                 base_url=m["base_url"],
                 api_key=m["api_key"],
-                model_kwargs={"parallel_tool_calls": False},
+                model_kwargs={"parallel_tool_calls": True},
                 temperature=0,
             )
 
@@ -127,7 +127,7 @@ def get_model_rotated():
                 model=m["name"],
                 base_url=m["base_url"],
                 api_key=m["api_key"],
-                model_kwargs={"parallel_tool_calls": False},
+                model_kwargs={"parallel_tool_calls": True},
                 temperature=0,
             )
 
@@ -262,7 +262,7 @@ Your job is to help team members manage and query the parts inventory.
 8. If the user asks something outside your scope, say:
    "I can only help with CURT's inventory management."
 
-9. Call exactly ONE database tool per turn. Do not chain multiple tool calls in the same turn. After the first tool result, answer immediately.
+9. You may chain multiple database tool calls if needed to answer the question. Call the most relevant tools in sequence and answer after you have all needed results.
 
 ## Tool Routing
 
@@ -303,7 +303,7 @@ Your job is to help team members manage and query the parts inventory.
 # CHATBOT
 # ============================================================
 
-MAX_HISTORY = 5
+MAX_HISTORY = 20
 
 
 async def Chatbot(
@@ -370,7 +370,7 @@ async def Chatbot(
 
             response = await agent.ainvoke(
                 {"messages": messages},
-                config={"recursion_limit": 8},
+                config={"recursion_limit": 12},
             )
 
 
