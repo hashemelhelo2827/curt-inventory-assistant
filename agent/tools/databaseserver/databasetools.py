@@ -33,7 +33,7 @@ def get_by_name(part_name: str):
 
 @mcp.tool()
 def get_by_category(category: str):
-    """Use for 'list all items in <category>' queries (Aero, Brakes, Suspension, etc.)."""
+    """Use for 'list all items in <category>' queries (Aero, Brakes, Suspension, etc.). Returns part_id (PRT-003), part_number (BRK-C-001), part_name, quantity total per model, car_position (Front Left/Right). Quantity 2 for BRK-C-001 means 1 Front Left + 1 Front Right, not 2 each."""
     return _fetch_parts("c.category", category)
 
 @mcp.tool()
@@ -205,8 +205,7 @@ def add_physical_unit(part_id: str, part_number: str, car_position: str,
                       next_inspection_due: str, max_usage_cycles: int,
                       critical_part: bool):
     """Add a new physical unit — inserts into PART, STATUS_CONDITION
-    and LIFECYCLE_TRACKING in one go.
-    Valid conditions: New, Used, Damaged, Under Repair
+    and LIFECYCLE_TRACKING in one go. Use existing part_number like BRK-D-001 for Brake Disc, generate new unique part_id like PRT-007. Even if a unit with same part_number+car_position exists, this creates an additional physical unit (inventory can have multiple). Valid conditions: New, Used, Damaged, Under Repair
     """
     with get_db_connection() as conn:
         cursor = conn.cursor()
@@ -332,7 +331,7 @@ def delete_part(part_number: str):
 
 @mcp.tool()
 def delete_physical_unit(part_id: str):
-    """Delete a physical unit.
+    """Delete a single physical unit by exact part_id like PRT-003, PRT-004, PRT-005, PRT-006 (from get_by_category). Never use invented IDs like BRK-C-FL-001. For Brakes, PRT-003=Front Left Caliper, PRT-004=Front Right Caliper, PRT-005=Front Left Disc, PRT-006=Front Right Disc. Always confirm before deleting.
     Cascades to: STATUS_CONDITION, LIFECYCLE_TRACKING
     """
     return _delete_from('PART', 'part_id', part_id)
