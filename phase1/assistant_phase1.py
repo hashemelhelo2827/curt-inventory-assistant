@@ -7,6 +7,7 @@ from agent.tools.databaseserver.databasetools import (
     # GET
     get_part_info,
     get_all_parts,
+    get_all_parts_name,
     get_by_category,
     get_low_stock,
     get_critical_parts,
@@ -217,6 +218,26 @@ def parse_question(question: str):
             return "delete_order", parts[2]
         return "invalid_delete", None
 
+    elif q.startswith("delete ") or q.startswith("remove "):
+        # natural delete: delete Brake Caliper, remove one front left, delete PRT-003, delete BRK-C-001
+        kw = q.replace("delete", "").replace("remove", "").replace("part", "").replace("unit", "").strip()
+        kw = kw.replace("one ", "").replace("the ", "").strip()
+        # keep original keyword for lookup (preserve case for PRT)
+        raw_kw = question.replace("delete", "").replace("Delete", "").replace("remove", "").replace("Remove", "").replace("part", "").replace("unit", "").strip()
+        raw_kw = raw_kw.replace("one ", "").replace("One ", "").strip()
+        if raw_kw:
+            return "delete_natural", raw_kw
+        if kw:
+            return "delete_natural", kw
+        return "invalid_delete", None
+
+    elif q.startswith("add ") or q.startswith("create "):
+        # natural add: add new Brake Disc (Front Left), add Brake Disc
+        raw_kw = question.replace("add", "").replace("Add", "").replace("create", "").replace("Create", "").replace("new", "").replace("New", "").strip()
+        if raw_kw:
+            return "add_natural", raw_kw
+        return "invalid_add", None
+
     else:
         return "unknown", None
 
@@ -231,13 +252,22 @@ def handle_question(question: str):
         result = get_part_info(keyword)
         if result:
             return f"We have {result['quantity']} {result['part_name']} in stock."
+        # misspelling fallback
+        import difflib
+        all_names = get_all_parts_name()
+        close = difflib.get_close_matches(keyword, all_names, n=1, cutoff=0.5)
+        if close:
+            info = get_part_info(close[0])
+            if info:
+                return f"Part '{keyword}' not found. Did you mean '{close[0]}'? We have {info['quantity']} {info['part_name']} in stock."
+            return f"Part '{keyword}' not found. Did you mean '{close[0]}'?"
         return f"Part '{keyword}' not found."
 
     elif intent == "where_is":
         with get_db_connection() as conn:
             cursor = conn.cursor()
             cursor.execute("""
-                SELECT c.part_name, s.location, s.assigned_to
+                SELECT c.part_name, s.location, s.assigned_to, p.part_id, p.car_position
                 FROM STATUS_CONDITION s
                 JOIN PART p ON p.part_id = s.part_id
                 JOIN CORE_PART_INFO c ON c.part_number = p.part_number
@@ -247,14 +277,34 @@ def handle_question(question: str):
         if results:
             responses = []
             for r in results:
-                responses.append(f"{r['part_name']} is at '{r['location']}' assigned to {r['assigned_to']}.")
+                responses.append(f"{r['part_name']} ({r['part_id']} {r['car_position']}) is at '{r['location']}' assigned to {r['assigned_to']}.")
             return "\n".join(responses)
+        # misspelling fallback
+        import difflib
+        all_names = get_all_parts_name()
+        close = difflib.get_close_matches(keyword, all_names, n=1, cutoff=0.5)
+        if close:
+            return f"Part '{keyword}' not found. Did you mean '{close[0]}'?"
         return f"Part '{keyword}' not found."
 
     elif intent == "list_category":
         results = get_by_category(keyword.title())
         if results:
-            lines = [f"  - {r['part_name']} (x{r['quantity']}) [{r['car_position']}]" for r in results]
+            # group by part_number to show total quantity correctly: e.g., Brake Caliper 2 total = 1 Front Left + 1 Front Right
+            from collections import defaultdict
+            grouped = defaultdict(list)
+            qty_map = {}
+            name_map = {}
+            for r in results:
+                grouped[r['part_number']].append(r)
+                qty_map[r['part_number']] = r['quantity']
+                name_map[r['part_number']] = r['part_name']
+            lines = []
+            for pn, rows in grouped.items():
+                total = qty_map[pn]
+                name = name_map[pn]
+                positions = ", ".join([f"{r['car_position']} ({r['part_id']})" for r in rows])
+                lines.append(f"  - {name} ({pn}) — {total} units total: {positions}")
             return f"Parts in {keyword.title()}:\n" + "\n".join(lines)
         return f"No parts found in category '{keyword}'."
 
@@ -403,32 +453,145 @@ def handle_question(question: str):
     # DELETE handlers
     # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     elif intent == "delete_part":
-        confirm = input(f"Are you sure you want to delete part '{keyword}'? (yes/no): ")
-        if confirm.lower() == "yes":
-            result = delete_part(keyword)
-            return f"Part deleted: {result}"
-        return "Delete cancelled."
+        # Streamlit-friendly: no input() blocking, direct delete
+        result = delete_part(keyword)
+        return f"Part deleted: {result}"
 
     elif intent == "delete_unit":
-        confirm = input(f"Are you sure you want to delete unit '{keyword}'? (yes/no): ")
-        if confirm.lower() == "yes":
-            result = delete_physical_unit(keyword)
-            return f"Unit deleted: {result}"
-        return "Delete cancelled."
+        result = delete_physical_unit(keyword)
+        return f"Unit deleted: {result}"
 
     elif intent == "delete_supplier":
-        confirm = input(f"Are you sure you want to delete supplier '{keyword}'? (yes/no): ")
-        if confirm.lower() == "yes":
-            result = delete_supplier(int(keyword))
-            return f"Supplier deleted: {result}"
-        return "Delete cancelled."
+        result = delete_supplier(int(keyword))
+        return f"Supplier deleted: {result}"
 
     elif intent == "delete_order":
-        confirm = input(f"Are you sure you want to delete order '{keyword}'? (yes/no): ")
-        if confirm.lower() == "yes":
-            result = delete_order(int(keyword))
-            return f"Order deleted: {result}"
-        return "Delete cancelled."
+        result = delete_order(int(keyword))
+        return f"Order deleted: {result}"
+
+    elif intent == "delete_natural":
+        kw = keyword.strip()
+        kw_upper = kw.upper()
+        # try part_id like PRT-003
+        if kw_upper.startswith("PRT-"):
+            with get_db_connection() as conn:
+                cur = conn.cursor()
+                cur.execute("SELECT part_id FROM PART WHERE part_id = ?", (kw_upper,))
+                if cur.fetchone():
+                    return f"Found unit {kw_upper} — reply 'delete unit {kw_upper}' to confirm deletion."
+                else:
+                    # try difflib for close PRT
+                    import difflib
+                    cur.execute("SELECT part_id FROM PART")
+                    all_ids = [r["part_id"] for r in cur.fetchall()]
+                    close = difflib.get_close_matches(kw_upper, all_ids, n=1, cutoff=0.6)
+                    if close:
+                        return f"Unit '{kw_upper}' not found. Did you mean '{close[0]}'? Reply 'delete unit {close[0]}' to delete."
+                    return f"Unit '{kw_upper}' not found."
+        # try part_number like BRK-C-001
+        if "-" in kw_upper and kw_upper.replace("-", "").replace("_", "").isalnum():
+            # check if it's a known part_number
+            with get_db_connection() as conn:
+                cur = conn.cursor()
+                cur.execute("SELECT part_number FROM CORE_PART_INFO WHERE UPPER(part_number)=?", (kw_upper,))
+                if cur.fetchone():
+                    # list physical units for this part_number
+                    with get_db_connection() as c2:
+                        cur2 = c2.cursor()
+                        cur2.execute("SELECT p.part_id, c.part_name, p.car_position FROM PART p JOIN CORE_PART_INFO c ON p.part_number=c.part_number WHERE p.part_number=?", (kw_upper,))
+                        rows = cur2.fetchall()
+                        if len(rows) == 1:
+                            r = rows[0]
+                            return f"Found 1 unit for {kw_upper} ({r['part_name']} {r['car_position']}) — reply 'delete unit {r['part_id']}' for single, or 'delete part {kw_upper}' to delete entire model ({len(rows)} units)."
+                        elif len(rows) > 1:
+                            lines = [f"  - {r['part_id']} | {r['part_name']} [{r['car_position']}]" for r in rows]
+                            return f"Found {len(rows)} units for {kw_upper}:\n" + "\n".join(lines) + f"\nReply 'delete unit PRT-xxx' for single, or 'delete part {kw_upper}' for model."
+        # try part name / position like Brake Caliper, front left
+        with get_db_connection() as conn:
+            cur = conn.cursor()
+            # LIKE search for part_name containing kw
+            cur.execute("SELECT p.part_id, c.part_number, c.part_name, p.car_position FROM PART p JOIN CORE_PART_INFO c ON p.part_number=c.part_number WHERE LOWER(c.part_name) LIKE LOWER(?) OR LOWER(p.car_position) LIKE LOWER(?) OR LOWER(c.part_name || ' ' || p.car_position) LIKE LOWER(?)", (f"%{kw}%", f"%{kw}%", f"%{kw}%"))
+            rows = cur.fetchall()
+            if rows:
+                if len(rows) == 1:
+                    r = rows[0]
+                    return f"Found 1 unit matching '{kw}': {r['part_id']} | {r['part_name']} [{r['car_position']}] — reply 'delete unit {r['part_id']}' to confirm."
+                else:
+                    lines = [f"  - {r['part_id']} | {r['part_name']} [{r['car_position']}] ({r['part_number']})" for r in rows]
+                    return f"Found {len(rows)} units matching '{kw}':\n" + "\n".join(lines) + "\nReply 'delete unit PRT-xxx' to delete single."
+            else:
+                import difflib
+                all_names = get_all_parts_name()
+                close = difflib.get_close_matches(kw, all_names, n=1, cutoff=0.5)
+                if close:
+                    info = get_part_info(close[0])
+                    qty = info['quantity'] if info else '?'
+                    return f"Part '{kw}' not found. Did you mean '{close[0]}'? We have {qty} in stock."
+                # also check categories
+                with get_db_connection() as c2:
+                    cur2 = c2.cursor()
+                    cur2.execute("SELECT DISTINCT category FROM CORE_PART_INFO")
+                    cats = [r["category"] for r in cur2.fetchall()]
+                    close_cat = difflib.get_close_matches(kw, cats, n=1, cutoff=0.6)
+                    if close_cat:
+                        return f"Category '{kw}' not found. Did you mean '{close_cat[0]}'?"
+                return f"Part '{kw}' not found."
+
+    elif intent == "add_natural":
+        kw = keyword.strip()
+        import re
+        from datetime import datetime, timedelta
+        # extract car_position
+        pos_match = re.search(r"(front left|front right|rear|front|back|left|right)", kw, re.I)
+        car_pos = pos_match.group(1).title() if pos_match else "Unknown"
+        # remove position and parentheses to get part_name
+        part_name_raw = re.sub(r"\(.*?\)", "", kw)
+        if pos_match:
+            part_name_raw = re.sub(re.escape(pos_match.group(1)), "", part_name_raw, flags=re.I)
+        part_name_raw = part_name_raw.strip()
+        # clean extra words like new, brake etc keep
+        if not part_name_raw:
+            part_name_raw = kw
+        # find part_number via get_part_info or LIKE
+        info = None
+        # try exact
+        info = get_part_info(part_name_raw)
+        if not info:
+            with get_db_connection() as conn:
+                cur = conn.cursor()
+                cur.execute("SELECT part_number, part_name, quantity FROM CORE_PART_INFO WHERE LOWER(part_name) LIKE LOWER(?)", (f"%{part_name_raw}%",))
+                row = cur.fetchone()
+                if row:
+                    info = dict(row)
+        if not info:
+            import difflib
+            all_names = get_all_parts_name()
+            close = difflib.get_close_matches(part_name_raw, all_names, n=1, cutoff=0.5)
+            if close:
+                return f"Part '{part_name_raw}' not found. Did you mean '{close[0]}'? Cannot add."
+            return f"Part '{part_name_raw}' not found. Cannot add."
+        part_number = info['part_number']
+        part_name = info['part_name']
+        # generate new part_id
+        with get_db_connection() as conn:
+            cur = conn.cursor()
+            cur.execute("SELECT part_id FROM PART")
+            max_num = 0
+            for r in cur.fetchall():
+                try:
+                    num = int(r["part_id"].split("-")[1])
+                    if num > max_num:
+                        max_num = num
+                except:
+                    pass
+            new_id = f"PRT-{max_num+1:03d}"
+        today = datetime.now().strftime("%Y-%m-%d")
+        next_due = (datetime.now() + timedelta(days=30)).strftime("%Y-%m-%d")
+        # normalize car_pos: if Unknown, default to Front Left for Brakes
+        if car_pos == "Unknown":
+            car_pos = "Front Left"
+        result = add_physical_unit(new_id, part_number, car_pos, "2024 CURT-01", "New", "Workshop", "None", today, next_due, 100, True)
+        return f"Added new unit {new_id} for {part_name} ({part_number}) at {car_pos}. Result: {result}"
 
     # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     # Invalid / Unknown
