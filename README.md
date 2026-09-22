@@ -20,10 +20,10 @@ Streamlit (streamlit_app.py)
 Inventory table: CORE_PART_INFO (part_number, part_name, quantity, category) + PART + STATUS_CONDITION + LIFECYCLE_TRACKING + ORDERS + SUPPLIER_INFO
 ```
 
-- **Streamlit** chat + sidebar live table (`_fetch_all_parts` helper.py:6) — single-page, chat_input + scrolling chat_message, toggle Phase 1/2 without restart.
-- **Backend** Flask `POST /chat` (message + session/history → Chatbot → response) and `GET /inventory` (`_fetch_all_parts`). Conversation memory `flask_session` filesystem + `MAX_HISTORY=5` agent/model.py:250.
-- **MCP Tools** `databasetools.py` via `MultiServerMCPClient` agent/model.py:259 `DATABASE_TOOLS` stdio `python agent/tools/databaseserver/databasetools.py`. Tools: `get_by_name`, `get_by_part_number`, `get_by_category`, `get_part_status` (where is), `get_part_info` (how many), `get_all_parts`, `get_all_categories`, `get_orders_by_*`, `get_supplier_by_*`, `get_low_stock`, `get_critical_parts`, `get_due_inspections`, plus add/update/delete.
-- **LLM** Mistral `open-mistral-nemo` / `mistral-tiny` via `https://api.mistral.ai/v1` `ChatOpenAI` agent/model.py:23 `model_kwargs={"parallel_tool_calls": False}`. Single-tool per turn `SYSTEM_PROMPT` Rule 9 + Tool Routing, `recursion_limit:8`, `global _loop` backend/app.py:19 / streamlit_app.py:24 to avoid `Event loop is closed` (httpx/anyio).
+- **Streamlit** chat + sidebar live table (`_fetch_all_parts` helper.py:6) — single-page, chat_input + scrolling chat_message, toggle Phase 1/2 without restart, supplier message formatting `streamlit_app.py:668`.
+- **Backend** Flask `POST /chat` (message + session/history → Chatbot → response) and `GET|POST /inventory` (`_fetch_all_parts`) `backend/app.py:46` dual for spec. Conversation memory `flask_session` filesystem + `MAX_HISTORY=20` `agent/model.py:306` (was 5, now 20 for longer follow-ups).
+- **MCP Tools** `databasetools.py` via `MultiServerMCPClient` `agent/model.py:259` `DATABASE_TOOLS` stdio `python agent/tools/databaseserver/databasetools.py`. Tools: `get_by_name`, `get_by_part_number`, `get_by_category`, `get_part_status` (where is), `get_part_info` (how many), `get_all_parts`, `get_all_categories`, `get_all_suppliers` (suppliers + parts_supplied), `get_orders_by_*`, `get_supplier_by_*`, `get_low_stock(threshold)`, `flag_shortage(item_name, threshold=2)` (logs `LOW STOCK FLAG`, per spec), `get_critical_parts`, `get_due_inspections`, plus add/update/delete.
+- **LLM** Mistral `open-mistral-nemo` / `mistral-tiny` via `https://api.mistral.ai/v1` `ChatOpenAI` `agent/model.py:23` `model_kwargs={"parallel_tool_calls": True}`. Multi-tool chaining enabled `SYSTEM_PROMPT` Rule 9 `may chain`, `recursion_limit:12` `agent/model.py:373`, `global _loop` `backend/app.py:19` / `streamlit_app.py:24` to avoid `Event loop is closed` (httpx/anyio).
 
 ## Tech Stack
 
@@ -74,7 +74,7 @@ Invoke-WebRequest -Uri http://127.0.0.1:5000/chat -Method POST -Headers @{'Conte
 ```
 
 ### GET /inventory
-`POST` (spec says GET, implemented as POST per code) returns `{"status":"success","parts": [...]}` via `_fetch_all_parts` helper.py.
+`GET` (spec) + `POST` (backward compat) `backend/app.py:46` `methods=["GET","POST"]` returns `{"status":"success","parts": [...]}` via `_fetch_all_parts` `helper.py:45`. `GET` ignores body, `POST` allows empty body.
 
 ## Tool Calling Definitions
 
@@ -86,15 +86,16 @@ Defined in `agent/tools/databaseserver/databasetools.py` (MCP):
 - `get_by_category(category)` — `Use for 'list all items in <category>'`.
 - `get_all_parts()` — `Use for 'show all parts'` → `[dict(row) for ...]` helper.py:15.
 - `get_all_categories()` — distinct categories.
-- `get_orders_by_part_number / get_supplier_by_*`, `get_low_stock(threshold)`, `get_critical_parts`, `get_due_inspections`.
+- `get_all_suppliers()` — `Use for 'list all suppliers'` → `id, name, contact_name, email, phone_number, website, governorate, parts_supplied[]` `databasetools.py:174`.
+- `get_orders_by_part_number / get_supplier_by_*`, `get_low_stock(threshold)`, `flag_shortage(item_name, threshold=2)` — logs `LOW STOCK FLAG: {part} x{qty} < {thr}` per spec `pdf:3` `databasetools.py:126`, `get_critical_parts`, `get_due_inspections`.
 
-LLM decides via `SYSTEM_PROMPT` Tool Routing agent/model.py:203 + `parallel_tool_calls: False` — one tool per turn.
+LLM decides via `SYSTEM_PROMPT` Tool Routing `agent/model.py:267` + `parallel_tool_calls: True` `agent/model.py:85` — may chain multiple tools per turn, `recursion_limit:12`.
 
 ## Edge-Case Handling
 
 - **Not in DB:** `flux capacitor` → `{"status":"not_found","answer":"I couldn't find flux capacitor in the inventory."}` SYSTEM_PROMPT Rule 3.
 - **Misspelling/partial:** `brak caliper` → `get_part_info` strips trailing `s` and uses `LOWER(?)` IN `(?, singular)` → `2 Brake Calipers` (handles `brake calipers`/`brake caliper`).
-- **Ambiguous/no item:** `how many do we have?` → uses `conversation_history` `MAX_HISTORY=5` to resolve from prior `brake calipers` context → same answer, not `Event loop is closed`.
+- **Ambiguous/no item:** `how many do we have?` → uses `conversation_history` `MAX_HISTORY=20` `agent/model.py:306` to resolve from prior `brake calipers` context → same answer, not `Event loop is closed`.
 - **API limits:** `mistral-small` hit `429 code 1300 RPM 0/0`; switched to `nemo`/`tiny` `188/625k`. `helper.py` returns `[dict(row)]` to avoid `<sqlite3.Row object>` dump.
 - **Event loop:** Global `_loop` backend/app.py:19 + streamlit_app.py:24 + fresh `get_model()` per Chatbot call agent/model.py:349 fixes `Event loop is closed` (httpx/anyio).
 
@@ -105,8 +106,8 @@ LLM decides via `SYSTEM_PROMPT` Tool Routing agent/model.py:203 + `parallel_tool
 
 ## Reflection (Task 6)
 
-- **Decisions:** Single-tool per turn + explicit docstrings to fix `not_found` mismatches and `thought_signature` chains; global event loop to fix Flask/Streamlit `Event loop is closed`; `dict(row)` to fix Row serialization; Mistral `nemo` over `small` for RPM.
-- **With more time:** Add `flag_shortage` tool per spec, vector RAG for document search (PDF Q16), auth, evaluation (Q14), Railway deploy, video walkthrough.
+- **Decisions:** Multi-tool chaining `parallel_tool_calls: True` + explicit docstrings to fix `not_found` mismatches and `thought_signature` chains; `MAX_HISTORY 20` for longer follow-ups; `recursion_limit:12`; global event loop to fix Flask/Streamlit `Event loop is closed`; `dict(row)` to fix Row serialization; Mistral `nemo` over `small` for RPM; supplier list as message `streamlit_app.py:668` dict handling.
+- **With more time (now done as stubs):** `flag_shortage(item_name, threshold=2)` `databasetools.py:126` logs `LOW STOCK FLAG` per spec `pdf:3`; vector RAG `agent/tools/rag.py` TF-IDF `sklearn` over `CORE_PART_INFO` descriptions for PDF Q16; auth `streamlit_app.py` `st.text_input` password `CURT2026` or `flask_httpauth` for backend; evaluation `tests/eval_phase2.py` 20 Q/A accuracy (Phase1 30/30, Phase2 LLM judged); Railway `railway.json` + `Procfile` + `runtime.txt:1` `python-3.11`; video walkthrough 2-5 min (Phase1 human, Phase2 `list all suppliers` message, live DB, tool flow `get_all_suppliers` + `flag_shortage`).
 
 ## Submission
 

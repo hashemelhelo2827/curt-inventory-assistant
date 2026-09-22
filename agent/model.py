@@ -272,6 +272,7 @@ Your job is to help team members manage and query the parts inventory.
 - "show all parts" -> get_all_parts
 - categories list -> get_all_categories
 - "list all suppliers" -> get_all_suppliers (returns id, name, contact_name, email, phone_number, website, governorate, parts_supplied)
+- "low stock" / "running low" -> get_low_stock(threshold) for list, flag_shortage(item_name, threshold) for single item (logs LOW STOCK FLAG per spec)
 - orders/supplier -> get_orders_by_* / get_supplier_by_*
 - "remove/delete physical unit" -> delete_physical_unit with exact part_id like PRT-003 (never invent BRK-C-FL-001)
 - "remove/delete part model" -> delete_part with exact part_number like BRK-C-001

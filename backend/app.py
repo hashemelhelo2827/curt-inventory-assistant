@@ -43,14 +43,17 @@ def chat():
     })
 
 
-@app.route("/inventory", methods=["POST"])
+@app.route("/inventory", methods=["GET", "POST"])
 def inventory():
-    data = request.get_json()
-
-    if not data:
-        return jsonify({
-            "error": "Missing request body"
-        }), 400
+    # GET per spec, POST kept for backward compat (Streamlit/backend)
+    if request.method == "POST":
+        data = request.get_json(silent=True)
+        # allow empty body for POST as well (spec says GET, impl was POST)
+        # only require body if provided, but not mandatory
+        if data is not None and not data and request.data:
+            return jsonify({
+                "error": "Missing request body"
+            }), 400
 
     try:
         parts = _fetch_all_parts()

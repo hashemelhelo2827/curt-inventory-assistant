@@ -124,6 +124,25 @@ def get_due_inspections():
 
 
 @mcp.tool()
+def flag_shortage(item_name: str, threshold: int = 2):
+    """Flag low stock for a single item. Logs LOW STOCK FLAG if quantity < threshold. Use for 'low stock' single-item checks per spec."""
+    info = get_part_info(item_name)
+    if not info:
+        # try close match for typo
+        import difflib
+        all_names = get_all_parts_name()
+        close = difflib.get_close_matches(item_name, all_names, n=1, cutoff=0.5)
+        if close:
+            info = get_part_info(close[0])
+        if not info:
+            return {"flagged": False, "error": f"Part '{item_name}' not found"}
+    qty = info["quantity"]
+    flagged = qty < threshold
+    if flagged:
+        print(f"LOW STOCK FLAG: {info['part_name']} x{qty} < {threshold}")
+    return {"flagged": flagged, "part_name": info["part_name"], "quantity": qty, "threshold": threshold}
+
+@mcp.tool()
 def get_low_stock(threshold: int):
     """Get all parts with quantity below the given threshold"""
     with get_db_connection() as conn:

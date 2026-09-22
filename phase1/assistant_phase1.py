@@ -11,6 +11,7 @@ from agent.tools.databaseserver.databasetools import (
     get_all_parts_name,
     get_by_category,
     get_low_stock,
+    flag_shortage,
     get_critical_parts,
     get_orders_by_part_number,
     get_orders_by_part_name,
@@ -677,6 +678,9 @@ def _handle_inner(question: str):
 
     elif intent == "low_stock":
         results = get_low_stock(2)
+        # log flag_shortage per spec for each low item
+        for r in results:
+            flag_shortage(r['part_name'], 2)
         if results:
             lines = [f"  - {r['part_name']} (x{r['quantity']}) [{r['category']}]" for r in results]
             return "Low stock parts:\n" + "\n".join(lines)

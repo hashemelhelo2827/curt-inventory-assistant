@@ -35,6 +35,21 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
+# --- Auth stub (env STREAMLIT_PASSWORD, default off for local) ---
+if os.getenv("STREAMLIT_PASSWORD"):
+    if "authenticated" not in st.session_state:
+        st.session_state.authenticated = False
+    if not st.session_state.authenticated:
+        st.markdown("### 🔒 CURT Login")
+        pwd = st.text_input("Password", type="password", key="auth_pwd")
+        if st.button("Login"):
+            if pwd == os.getenv("STREAMLIT_PASSWORD"):
+                st.session_state.authenticated = True
+                st.rerun()
+            else:
+                st.error("Wrong password")
+        st.stop()
+
 # --- Design Taste: Custom CSS ---
 st.markdown("""
 <style>
