@@ -39,19 +39,110 @@ from agent.tools.databaseserver.databasetools import (
     delete_order,
 )
 from agent.tools.databaseserver.helper import get_db_connection
+import re
+last_suggestion = None
+
+def _strip_filler_for_kw(q: str) -> str:
+    # remove filler words anywhere, keep IDs intact via placeholder
+    return re.sub(r"\b(please|bro|hey|hi|hello|thanks|thank you|the|a|an|can|could|would|you|show|give|get|tell|me|about|what|details|detail|info|on|for|of|my|i|need|want|to|see|like|know|please|thanks|bro|hey)\b", "", q, flags=re.I).strip()
+
+def _normalize_human(q: str) -> str:
+    # human filler removal and ID normalization for human typing like prt 003, brk c 001, please, bro, hey, brake-caliper, PRT-003 | Brake Caliper
+    # preserve IDs via placeholder to avoid hyphen/punct stripping breaking them
+    ids = []
+    def _store(m):
+        raw = m.group(0)
+        # normalize: remove spaces, ensure dash format, upper
+        norm = re.sub(r"\s+", "", raw).upper()
+        # normalize spaced dash variants: ensure single dash between groups
+        norm = re.sub(r"\s*-\s*", "-", norm)
+        # fix PRT003 -> PRT-003 before PN logic (PRT is 3 letters, not 4)
+        if re.match(r"^PRT\d{3,4}$", norm):
+            mm = re.match(r"^(PRT)(\d+)$", norm)
+            if mm:
+                norm = f"{mm.group(1)}-{mm.group(2)}"
+        # fix BRKC001 -> BRK-C-001 (no dashes at all) — 4 letters + digits, split 3+1
+        elif re.match(r"^[A-Z]{4}\d{3,4}$", norm):
+            mm = re.match(r"^([A-Z]{3})([A-Z])(\d{3,4})$", norm)
+            if mm:
+                norm = f"{mm.group(1)}-{mm.group(2)}-{mm.group(3)}"
+        elif re.match(r"^[A-Z]{2,4}[A-Z]\d{3,4}$", norm) and len(re.match(r"^([A-Z]+)\d+", norm).group(1)) == 4:
+            mm = re.match(r"^([A-Z]{2,4})([A-Z])(\d{3,4})$", norm)
+            if mm:
+                norm = f"{mm.group(1)}-{mm.group(2)}-{mm.group(3)}"
+        # fix BRK-C001 -> BRK-C-001
+        elif re.match(r"^[A-Z]{2,4}-[A-Z]\d{3,4}$", norm):
+            mm = re.match(r"^([A-Z]{2,4}-[A-Z])(\d{3,4})$", norm)
+            if mm:
+                norm = f"{mm.group(1)}-{mm.group(2)}"
+        # ensure generic PRT-003 format (e.g., WHL003 -> WHL-003) if missing dash and not above
+        elif re.match(r"^[A-Z]{2,4}\d{3,4}$", norm):
+            mm = re.match(r"^([A-Z]+)(\d+)$", norm)
+            if mm:
+                norm = f"{mm.group(1)}-{mm.group(2)}"
+        ids.append(norm)
+        return f"__ID{len(ids)-1}__"
+    # extract PN/PRT with optional spaces/dashes — run BEFORE filler/punct stripping
+    # PN: BRK-C-001, WNG-F-001, also brk c 001, brk c001, BRK C 001
+    # PRT: PRT-003, prt 003, prt003
+    q_placed = re.sub(r"\b(?:PRT\s*-?\s*\d{3,4}|[A-Z]{2,4}\s*-?\s*[A-Z]\s*-?\s*\d{3,4})\b", _store, q, flags=re.I)
+    # also handle PRT without dash but with space: already covered, but add standalone PRT\d
+    # strip pipe and punctuation to space (IDs are placeholder-protected)
+    q_placed = re.sub(r"[|]", " ", q_placed)
+    q_placed = re.sub(r"[?.!,;:()\"']", " ", q_placed)
+    # hyphenated words -> space (IDs protected)
+    q_placed = re.sub(r"[-]", " ", q_placed)
+    # global filler removal on the placeholder string (IDs not affected)
+    # remove leading/trailing filler phrases first
+    q_placed = re.sub(r"^(can you|can you please|could you|please|hey|hi|bro|hello|thanks|thank you|what about|tell me about|show me|give me)\s+", "", q_placed, flags=re.I)
+    # remove filler words anywhere
+    q_placed = re.sub(r"\b(please|thanks|thank you|bro|hey|hi|hello|the|a|an)\b", " ", q_placed, flags=re.I)
+    # also strip common conversational scaffolding for bare noun detection — keep intent words show/give/get/tell/about/what/for/of/on for orders/supplier/where_is detection
+    q_placed = re.sub(r"\b(can|could|would|you|me|details|detail|info|my|i|need|want|to|see|like|know)\b", " ", q_placed, flags=re.I)
+    # collapse spaces
+    q_placed = re.sub(r"\s+", " ", q_placed).strip()
+    # restore IDs lowercased (parse uses lower)
+    for i, norm in enumerate(ids):
+        q_placed = q_placed.replace(f"__ID{i}__", norm.lower())
+    # final normalize any remaining spaced IDs that were not captured due to lowercasing order: prt 003 -> already captured, but ensure prt-003 stays
+    q_placed = re.sub(r"\b([a-z]{2,4})\s*-\s*([a-z])\s*(\d{3,4})", r"\1-\2-\3", q_placed, flags=re.I)
+    q_placed = re.sub(r"\b(prt)\s+(\d{3,4})", r"\1-\2", q_placed, flags=re.I)
+    q_placed = re.sub(r"\s+", " ", q_placed).strip()
+    return q_placed
+
 def parse_question(question: str):
+    import re
     q = question.lower().strip()
-    parts = shlex.split(question)
+    q = _normalize_human(q)
+    # human confirm after Did you mean — also handle punct stripped "yes."
+    q_confirm = q.strip().lower()
+    if q_confirm in ["yes", "yeah", "yep", "ok", "okay", "confirm", "sure", "y", "yes please", "yeah please", "yes.", "yeah.", "yep."]:
+        return "confirm_yes", None
+    # human ambiguous like delete it / remove one / list them — also empty after filler strip for how many no item
+    if q.strip().lower() in ["delete it", "remove it", "remove one", "delete one", "list them", "show them"]:
+        return "ambiguous", q
+    # collapsed how_many empty check
+    # use normalized q for parts splitting fallback — keep original for shlex structured commands
+    try:
+        parts = shlex.split(question)
+    except:
+        parts = question.split()
 
     # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     # GET patterns (natural language)
     # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     if "how many" in q and "do we have" in q:
         item = q.replace("how many", "").replace("do we have", "").replace("?", "").strip()
+        item = _strip_filler_for_kw(item).strip()
+        if not item:
+            return "ambiguous", q
         return "how_many", item
 
     elif "where is" in q:
         item = q.replace("where is the", "").replace("where is", "").replace("?", "").strip()
+        item = _strip_filler_for_kw(item).strip()
+        if not item:
+            return "ambiguous", q
         return "where_is", item
 
     elif "list all" in q and "in" in q:
@@ -63,14 +154,15 @@ def parse_question(question: str):
 
     elif q.startswith("list ") or q.startswith("show ") or q.startswith("give ") or q.startswith("get "):
         # hard natural list: list Brake Caliper (BRK-C-001), show brake caliper details, give me info on BRK-C-001
+        # use normalized q (already filler-stripped) not raw question to handle "please list calipers"
         import re
-        raw = question.strip()
-        # extract part_number like BRK-C-001 even with spaces/brackets
-        m = re.search(r"[A-Z]{2,4}\s*-\s*[A-Z]\s*-\s*\d{3,4}", raw, re.I)
+        raw = q
+        # extract part_number like BRK-C-001 even with spaces/brackets — use q (ids already normalized)
+        m = re.search(r"\b([a-z]{2,4}-[a-z]-\d{3,4}|prt-\d{3,4})\b", raw, re.I)
         if m:
-            pn = re.sub(r"\s+", "", m.group(0)).upper()
+            pn = m.group(0).upper()
             return "list_by_number", pn
-        m2 = re.search(r"\(\s*([A-Z]{2,4}-[A-Z]-\d{3})\s*\)", raw, re.I)
+        m2 = re.search(r"\(\s*([A-Z]{2,4}-[A-Z]-\d{3})\s*\)", question, re.I)
         if m2:
             return "list_by_number", m2.group(1).upper()
         # fallback: extract name after list/show/give/get
@@ -79,6 +171,7 @@ def parse_question(question: str):
         kw = re.sub(r"\(.*?\)", "", kw).strip()
         # remove filler including the
         kw = re.sub(r"\b(items|item|part|details|info|show|me|please|give|get|on|for|the)\b", "", kw, flags=re.I)
+        kw = _strip_filler_for_kw(kw).strip()
         kw = " ".join(kw.split())
         kw = kw.replace("?", "").strip()
         if kw and kw.lower() not in ["all", ""]:
@@ -243,15 +336,19 @@ def parse_question(question: str):
 
     elif q.startswith("delete ") or q.startswith("remove "):
         # natural delete: delete Brake Caliper, remove one front left, delete PRT-003, delete BRK-C-001
+        # use normalized q (please already stripped) as primary, fallback to raw only if needed
         kw = q.replace("delete", "").replace("remove", "").replace("part", "").replace("unit", "").strip()
-        kw = kw.replace("one ", "").replace("the ", "").strip()
-        # keep original keyword for lookup (preserve case for PRT)
+        kw = _strip_filler_for_kw(kw).replace("one ", "").replace("the ", "").strip()
+        kw = re.sub(r"\s+", " ", kw).strip()
+        # keep original keyword for lookup (preserve case for PRT) but also strip filler
         raw_kw = question.replace("delete", "").replace("Delete", "").replace("remove", "").replace("Remove", "").replace("part", "").replace("unit", "").strip()
+        raw_kw = re.sub(r"\b(please|bro|hey|hi|hello|thanks)\b", "", raw_kw, flags=re.I).strip()
         raw_kw = raw_kw.replace("one ", "").replace("One ", "").strip()
-        if raw_kw:
-            return "delete_natural", raw_kw
+        raw_kw = re.sub(r"\s+", " ", raw_kw).strip()
         if kw:
             return "delete_natural", kw
+        if raw_kw:
+            return "delete_natural", raw_kw
         return "invalid_delete", None
 
     elif q.startswith("add ") or q.startswith("create "):
@@ -261,11 +358,65 @@ def parse_question(question: str):
             return "add_natural", raw_kw
         return "invalid_add", None
 
+    # ───────────────────────────────────────
+    # HUMAN fallback — bare PN or bare noun without prefix
+    # covers: "brake caliper", "brake calipers", "can you show me the brake calipers please", "what about BRK-C-001", "brk c 001", "prt 003", "calipars", "brake-caliper", "ecu", "caliper", etc.
+    # ───────────────────────────────────────
     else:
+        # bare part_number / PRT detection on normalized q
+        import re as _re2
+        m_pn = _re2.search(r"\b(prt-\d{3,4}|[a-z]{2,4}-[a-z]-\d{3,4})\b", q)
+        if m_pn:
+            pn = m_pn.group(0).upper()
+            return "list_by_number", pn
+        # also search original question for spaced IDs that normalize missed (fallback)
+        m_pn_raw = _re2.search(r"\b(?:PRT\s*-?\s*\d{3,4}|[A-Z]{2,4}\s*-?\s*[A-Z]\s*-?\s*\d{3,4})\b", question, _re2.I)
+        if m_pn_raw:
+            pn_raw = _re2.sub(r"\s+", "", m_pn_raw.group(0)).upper()
+            pn_raw = _re2.sub(r"\s*-\s*", "-", pn_raw)
+            if _re2.match(r"^[A-Z]{2,4}-[A-Z]\d{3,4}$", pn_raw):
+                mm = _re2.match(r"^([A-Z]{2,4}-[A-Z])(\d+)$", pn_raw)
+                if mm:
+                    pn_raw = f"{mm.group(1)}-{mm.group(2)}"
+            return "list_by_number", pn_raw
+        # bare noun human — anything that looks like a part query after filler stripping
+        if q and q not in ["hello", "hi", "hey", "thanks", "thank you", "please", "ok"]:
+            known_fragments = ["caliper", "calipers", "disc", "discs", "wing", "ecu", "engine", "monocoque", "rim", "suspension", "steering", "brake", "chassis", "aero", "powertrain", "electronics", "safety", "cooling", "wheels", "brembo", "honda", "motec", "oz", "woodward"]
+            has_fragment = any(frag in q for frag in known_fragments)
+            if has_fragment:
+                kw = _strip_filler_for_kw(q).strip()
+                if kw and kw.lower() not in ["all", ""]:
+                    return "list_by_name", kw
+            else:
+                import difflib
+                tokens = q.split()
+                for tok in tokens:
+                    for frag in known_fragments:
+                        if difflib.get_close_matches(tok, [frag], n=1, cutoff=0.6):
+                            kw = _strip_filler_for_kw(q).strip()
+                            if kw:
+                                return "list_by_name", kw
+                            break
+                    else:
+                        continue
+                    break
+                if not has_fragment:
+                    if len(tokens) <= 4 and len(q) >= 3 and len(q) <= 30:
+                        from agent.tools.databaseserver.databasetools import get_all_parts_name as _gapn
+                        try:
+                            all_names = [n.lower() for n in _gapn()]
+                            close = difflib.get_close_matches(q, all_names + known_fragments, n=1, cutoff=0.5)
+                            if close:
+                                kw = _strip_filler_for_kw(q).strip()
+                                if kw:
+                                    return "list_by_name", kw
+                        except:
+                            pass
         return "unknown", None
 
 
 def handle_question(question: str):
+    global last_suggestion
     intent, keyword = parse_question(question)
 
     # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
@@ -275,15 +426,29 @@ def handle_question(question: str):
         result = get_part_info(keyword)
         if result:
             return f"We have {result['quantity']} {result['part_name']} in stock."
-        # misspelling fallback
+        # misspelling fallback — case-insensitive
         import difflib
         all_names = get_all_parts_name()
-        close = difflib.get_close_matches(keyword, all_names, n=1, cutoff=0.5)
-        if close:
-            info = get_part_info(close[0])
+        all_lower = [n.lower() for n in all_names]
+        close_lower = difflib.get_close_matches(keyword.lower(), all_lower, n=1, cutoff=0.5)
+        if close_lower:
+            idx = all_lower.index(close_lower[0])
+            close = all_names[idx]
+            last_suggestion = close
+            info = get_part_info(close)
             if info:
-                return f"Part '{keyword}' not found. Did you mean '{close[0]}'? We have {info['quantity']} {info['part_name']} in stock."
-            return f"Part '{keyword}' not found. Did you mean '{close[0]}'?"
+                return f"Part '{keyword}' not found. Did you mean '{close}'? We have {info['quantity']} {info['part_name']} in stock."
+            return f"Part '{keyword}' not found. Did you mean '{close}'?"
+        # looser
+        close_lower2 = difflib.get_close_matches(keyword.lower(), all_lower, n=1, cutoff=0.4)
+        if close_lower2:
+            idx = all_lower.index(close_lower2[0])
+            close = all_names[idx]
+            last_suggestion = close
+            info = get_part_info(close)
+            if info:
+                return f"Part '{keyword}' not found. Did you mean '{close}'? We have {info['quantity']} {info['part_name']} in stock."
+            return f"Part '{keyword}' not found. Did you mean '{close}'?"
         return f"Part '{keyword}' not found."
 
     elif intent == "where_is":
@@ -335,9 +500,19 @@ def handle_question(question: str):
                 return "\n".join([f"{r['part_name']} ({r['part_id']} {r['car_position']}) is at '{r['location']}' assigned to {r['assigned_to']}." for r in rows])
         import difflib
         all_names = get_all_parts_name()
-        close = difflib.get_close_matches(keyword, all_names, n=1, cutoff=0.5)
-        if close:
-            return f"Part '{keyword}' not found. Did you mean '{close[0]}'?"
+        all_lower = [n.lower() for n in all_names]
+        close_lower = difflib.get_close_matches(keyword.lower(), all_lower, n=1, cutoff=0.5)
+        if close_lower:
+            idx = all_lower.index(close_lower[0])
+            close = all_names[idx]
+            last_suggestion = close
+            return f"Part '{keyword}' not found. Did you mean '{close}'?"
+        close_lower2 = difflib.get_close_matches(keyword.lower(), all_lower, n=1, cutoff=0.4)
+        if close_lower2:
+            idx = all_lower.index(close_lower2[0])
+            close = all_names[idx]
+            last_suggestion = close
+            return f"Part '{keyword}' not found. Did you mean '{close}'?"
         return f"Part '{keyword}' not found."
 
     elif intent == "list_category":
@@ -362,7 +537,25 @@ def handle_question(question: str):
         return f"No parts found in category '{keyword}'."
 
     elif intent == "list_by_number":
-        # keyword is part_number like BRK-C-001
+        # keyword is part_number like BRK-C-001 or PRT-003
+        import difflib, re as _re
+        # handle physical ID PRT-xxx first
+        if _re.match(r"^PRT-\d{3,4}$", keyword, _re.I):
+            with get_db_connection() as conn:
+                cur = conn.cursor()
+                cur.execute("SELECT c.part_name, c.part_number, c.quantity, c.category, p.part_id, p.car_position FROM PART p JOIN CORE_PART_INFO c ON p.part_number=c.part_number WHERE UPPER(p.part_id)=UPPER(?)", (keyword,))
+                rows = cur.fetchall()
+                if rows:
+                    lines = [f"  - {r['part_name']} ({r['part_number']}) [{r['car_position']} {r['part_id']}] qty:{r['quantity']} {r['category']}" for r in rows]
+                    return f"Details for {keyword.upper()}:\n" + "\n".join(lines)
+                # try close for PRT
+                cur.execute("SELECT part_id FROM PART")
+                all_ids = [row["part_id"] for row in cur.fetchall()]
+                close = difflib.get_close_matches(keyword.upper(), all_ids, n=1, cutoff=0.6)
+                if close:
+                    last_suggestion = close[0]
+                    return f"Part ID '{keyword}' not found. Did you mean '{close[0]}'?"
+                return f"Part ID '{keyword}' not found."
         from agent.tools.databaseserver.databasetools import get_by_part_number as _gpn
         results = _gpn(keyword.upper())
         if results:
@@ -372,13 +565,13 @@ def handle_question(question: str):
                 lines.append(f"  - {r['part_name']} ({r['part_number']}) [{r['car_position']} {r['part_id']}] qty:{r['quantity']} {r['category']}")
             return f"Details for {keyword.upper()}:\n" + "\n".join(lines)
         # try difflib for close part_number
-        import difflib
         with get_db_connection() as conn:
             cur = conn.cursor()
             cur.execute("SELECT part_number FROM CORE_PART_INFO")
             all_pn = [row["part_number"] for row in cur.fetchall()]
             close = difflib.get_close_matches(keyword.upper(), all_pn, n=1, cutoff=0.6)
             if close:
+                last_suggestion = close[0]
                 return f"Part number '{keyword}' not found. Did you mean '{close[0]}'?"
         return f"Part number '{keyword}' not found."
 
@@ -408,11 +601,54 @@ def handle_question(question: str):
                     pos = ", ".join([f"{x['car_position']} ({x['part_id']})" for x in lst])
                     lines.append(f"  - {name} ({pn}) — {qty} units: {pos}")
                 return f"Details for '{kw}':\n" + "\n".join(lines)
+            # try singular for plural like calipers -> caliper
+            if kw.lower().endswith('s'):
+                singular = kw[:-1]
+                with get_db_connection() as conn2:
+                    cur2 = conn2.cursor()
+                    cur2.execute("SELECT p.part_id, c.part_number, c.part_name, c.quantity, p.car_position FROM PART p JOIN CORE_PART_INFO c ON p.part_number=c.part_number WHERE LOWER(c.part_name) LIKE LOWER(?)", (f"%{singular}%",))
+                    rows2 = cur2.fetchall()
+                    if rows2:
+                        from collections import defaultdict
+                        grouped2 = defaultdict(list)
+                        for r in rows2:
+                            grouped2[r["part_number"]].append(r)
+                        lines2 = []
+                        for pn, lst in grouped2.items():
+                            name2 = lst[0]["part_name"]
+                            qty2 = lst[0]["quantity"]
+                            pos2 = ", ".join([f"{x['car_position']} ({x['part_id']})" for x in lst])
+                            lines2.append(f"  - {name2} ({pn}) — {qty2} units: {pos2}")
+                        return f"Details for '{kw}' (as '{singular}'):\n" + "\n".join(lines2)
             import difflib
             all_names = get_all_parts_name()
-            close = difflib.get_close_matches(kw, all_names, n=1, cutoff=0.5)
-            if close:
-                return f"Part '{kw}' not found. Did you mean '{close[0]}'?"
+            # case-insensitive difflib — lower both
+            all_lower = [n.lower() for n in all_names]
+            # try direct lower
+            close_lower = difflib.get_close_matches(kw.lower(), all_lower, n=1, cutoff=0.5)
+            if close_lower:
+                # map back to original case
+                idx = all_lower.index(close_lower[0])
+                close = all_names[idx]
+                last_suggestion = close
+                return f"Part '{kw}' not found. Did you mean '{close}'?"
+            # fallback looser cutoff for heavily typo like calipars -> Brake Caliper (0.57)
+            close_lower2 = difflib.get_close_matches(kw.lower(), all_lower, n=1, cutoff=0.4)
+            if close_lower2:
+                idx = all_lower.index(close_lower2[0])
+                close = all_names[idx]
+                last_suggestion = close
+                return f"Part '{kw}' not found. Did you mean '{close}'?"
+            # also check token-level close for single word typos
+            tokens = kw.lower().split()
+            for tok in tokens:
+                close_tok = difflib.get_close_matches(tok, [n.lower() for n in all_names] + ["caliper","disc","wing","ecu","engine","monocoque","rim","suspension","steering"], n=1, cutoff=0.6)
+                if close_tok:
+                    # find best part containing that token
+                    for name in all_names:
+                        if close_tok[0] in name.lower():
+                            last_suggestion = name
+                            return f"Part '{kw}' not found. Did you mean '{name}'?"
             return f"Part '{kw}' not found."
 
     elif intent == "all_parts":
@@ -579,24 +815,46 @@ def handle_question(question: str):
     elif intent == "delete_natural":
         kw = keyword.strip()
         kw_upper = kw.upper()
-        # try part_id like PRT-003
-        if kw_upper.startswith("PRT-"):
+        import re as _re
+        # extract PRT-xxx even with " | Brake Caliper" or spaces
+        m_prt = _re.search(r"PRT\s*-\s*\d+", kw_upper)
+        if m_prt:
+            pid = _re.sub(r"\s+", "", m_prt.group(0)).upper()
             with get_db_connection() as conn:
                 cur = conn.cursor()
-                cur.execute("SELECT part_id FROM PART WHERE part_id = ?", (kw_upper,))
+                cur.execute("SELECT part_id FROM PART WHERE part_id = ?", (pid,))
                 if cur.fetchone():
-                    return f"Found unit {kw_upper} — reply 'delete unit {kw_upper}' to confirm deletion."
+                    # direct delete for human typing - no extra confirm loop
+                    result = delete_physical_unit(pid)
+                    return f"Unit {pid} deleted: {result}"
                 else:
-                    # try difflib for close PRT
                     import difflib
                     cur.execute("SELECT part_id FROM PART")
                     all_ids = [r["part_id"] for r in cur.fetchall()]
-                    close = difflib.get_close_matches(kw_upper, all_ids, n=1, cutoff=0.6)
+                    close = difflib.get_close_matches(pid, all_ids, n=1, cutoff=0.6)
                     if close:
-                        return f"Unit '{kw_upper}' not found. Did you mean '{close[0]}'? Reply 'delete unit {close[0]}' to delete."
-                    return f"Unit '{kw_upper}' not found."
-        # try part_number like BRK-C-001
-        if "-" in kw_upper and kw_upper.replace("-", "").replace("_", "").isalnum():
+                        return f"Unit '{pid}' not found. Did you mean '{close[0]}'? Reply 'delete unit {close[0]}' to delete."
+                    return f"Unit '{pid}' not found."
+        # extract part_number like BRK-C-001 even inside parentheses "Brake Caliper (BRK-C-001)"
+        m_pn = _re.search(r"[A-Z]{2,4}\s*-\s*[A-Z]\s*-\s*\d{3,4}", kw, _re.I)
+        if m_pn:
+            pn = _re.sub(r"\s+", "", m_pn.group(0)).upper()
+            with get_db_connection() as conn:
+                cur = conn.cursor()
+                cur.execute("SELECT part_number FROM CORE_PART_INFO WHERE UPPER(part_number)=?", (pn,))
+                if cur.fetchone():
+                    with get_db_connection() as c2:
+                        cur2 = c2.cursor()
+                        cur2.execute("SELECT p.part_id, c.part_name, p.car_position FROM PART p JOIN CORE_PART_INFO c ON p.part_number=c.part_number WHERE p.part_number=?", (pn,))
+                        rows = cur2.fetchall()
+                        if len(rows) == 1:
+                            r = rows[0]
+                            return f"Found 1 unit for {pn} ({r['part_name']} {r['car_position']}) — reply 'delete unit {r['part_id']}' for single, or 'delete part {pn}' to delete entire model ({len(rows)} units)."
+                        elif len(rows) > 1:
+                            lines = [f"  - {r['part_id']} | {r['part_name']} [{r['car_position']}]" for r in rows]
+                            return f"Found {len(rows)} units for {pn}:\n" + "\n".join(lines) + f"\nReply 'delete unit PRT-xxx' for single, or 'delete part {pn}' for model."
+            # also handle bare part_number without prior extraction
+        if "-" in kw_upper and kw_upper.replace("-", "").replace("_", "").replace(" ", "").replace("(", "").replace(")", "").isalnum():
             # check if it's a known part_number
             with get_db_connection() as conn:
                 cur = conn.cursor()
@@ -631,6 +889,7 @@ def handle_question(question: str):
                 all_names = get_all_parts_name()
                 close = difflib.get_close_matches(kw, all_names, n=1, cutoff=0.5)
                 if close:
+                    last_suggestion = close[0]
                     info = get_part_info(close[0])
                     qty = info['quantity'] if info else '?'
                     return f"Part '{kw}' not found. Did you mean '{close[0]}'? We have {qty} in stock."
@@ -641,6 +900,7 @@ def handle_question(question: str):
                     cats = [r["category"] for r in cur2.fetchall()]
                     close_cat = difflib.get_close_matches(kw, cats, n=1, cutoff=0.6)
                     if close_cat:
+                        last_suggestion = close_cat[0]
                         return f"Category '{kw}' not found. Did you mean '{close_cat[0]}'?"
                 return f"Part '{kw}' not found."
 
@@ -700,9 +960,16 @@ def handle_question(question: str):
         result = add_physical_unit(new_id, part_number, car_pos, "2024 CURT-01", "New", "Workshop", "None", today, next_due, 100, True)
         return f"Added new unit {new_id} for {part_name} ({part_number}) at {car_pos}. Result: {result}"
 
-    # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-    # Invalid / Unknown
-    # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    elif intent == "confirm_yes":
+        if last_suggestion:
+            kw = last_suggestion
+            last_suggestion = None
+            return handle_question(f"list {kw}")
+        return "Please specify which part you meant, e.g., 'list Brake Caliper' or 'delete unit PRT-003'."
+
+    elif intent == "ambiguous":
+        return "Which item? Please be specific — e.g., 'delete Brake Caliper' then choose PRT-003, or 'list Brake Caliper (BRK-C-001)', or 'where is BRK-C-001'."
+
     elif "invalid" in intent:
         return (f"Invalid command format. Usage:\n"
                 f"  add part <part_number> <part_name> <category> <description> <manufacturer> <weight_kg> <material> <dimensions> <color> <supplier_id> <unit_cost> <lead_time_days> <critical_part>\n"
