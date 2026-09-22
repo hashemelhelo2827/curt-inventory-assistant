@@ -1,6 +1,7 @@
 ﻿import sys
 import os
 import shlex
+import sqlite3
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 from agent.tools.databaseserver.databasetools import (
@@ -417,6 +418,15 @@ def parse_question(question: str):
 
 def handle_question(question: str):
     global last_suggestion
+    try:
+        return _handle_inner(question)
+    except sqlite3.OperationalError as e:
+        return f"Database error: {str(e)[:200]}"
+    except Exception as e:
+        return f"Error: {str(e)[:200]}"
+
+def _handle_inner(question: str):
+    global last_suggestion
     intent, keyword = parse_question(question)
 
     # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
@@ -487,7 +497,7 @@ def handle_question(question: str):
         # LIKE fallback without the, and misspelling
         with get_db_connection() as conn:
             cur = conn.cursor()
-            cur.execute("SELECT c.part_name FROM CORE_PART_INFO WHERE LOWER(c.part_name) LIKE LOWER(?)", (f"%{kw}%",))
+            cur.execute("SELECT part_name FROM CORE_PART_INFO WHERE LOWER(part_name) LIKE LOWER(?)", (f"%{kw}%",))
             if cur.fetchone():
                 cur.execute("""
                     SELECT c.part_name, s.location, s.assigned_to, p.part_id, p.car_position
