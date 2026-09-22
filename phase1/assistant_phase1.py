@@ -806,21 +806,28 @@ def _handle_inner(question: str):
     # DELETE handlers
     # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     elif intent == "delete_part":
-        # Streamlit-friendly: no input() blocking, direct delete
         result = delete_part(keyword)
-        return f"Part deleted: {result}"
+        if result.get("deleted", 0):
+            return f"Part {keyword} deleted"
+        return f"Part '{keyword}' not found."
 
     elif intent == "delete_unit":
         result = delete_physical_unit(keyword)
-        return f"Unit deleted: {result}"
+        if result.get("deleted", 0):
+            return f"Unit {keyword} deleted"
+        return f"Unit '{keyword}' not found."
 
     elif intent == "delete_supplier":
         result = delete_supplier(int(keyword))
-        return f"Supplier deleted: {result}"
+        if result.get("deleted", 0):
+            return f"Supplier {keyword} deleted"
+        return f"Supplier '{keyword}' not found."
 
     elif intent == "delete_order":
         result = delete_order(int(keyword))
-        return f"Order deleted: {result}"
+        if result.get("deleted", 0):
+            return f"Order {keyword} deleted"
+        return f"Order '{keyword}' not found."
 
     elif intent == "delete_natural":
         kw = keyword.strip()
@@ -834,9 +841,10 @@ def _handle_inner(question: str):
                 cur = conn.cursor()
                 cur.execute("SELECT part_id FROM PART WHERE part_id = ?", (pid,))
                 if cur.fetchone():
-                    # direct delete for human typing - no extra confirm loop
                     result = delete_physical_unit(pid)
-                    return f"Unit {pid} deleted: {result}"
+                    if result.get("deleted", 0):
+                        return f"Unit {pid} deleted"
+                    return f"Unit '{pid}' not found."
                 else:
                     import difflib
                     cur.execute("SELECT part_id FROM PART")
