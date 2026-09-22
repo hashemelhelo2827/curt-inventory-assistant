@@ -171,6 +171,29 @@ def get_all_categories():
             ORDER BY category
         """)
         return [row['category'] for row in cursor.fetchall()]
+
+@mcp.tool()
+def get_all_suppliers():
+    """Get all unique suppliers with contact info and parts they supply. Use for 'list all suppliers'."""
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT s.id, s.name, s.contact_name, s.email, s.phone_number, s.website, s.governorate,
+                   GROUP_CONCAT(c.part_name || ' (' || c.part_number || ')', ', ') as parts_supplied
+            FROM SUPPLIER_INFO s
+            LEFT JOIN PART_SUPPLIER ps ON ps.supplier_id = s.id
+            LEFT JOIN CORE_PART_INFO c ON c.part_number = ps.part_number
+            GROUP BY s.id
+            ORDER BY s.name
+        """)
+        rows = [dict(row) for row in cursor.fetchall()]
+        # ensure parts_supplied is list for clarity
+        for r in rows:
+            if r.get("parts_supplied"):
+                r["parts_supplied"] = [p.strip() for p in r["parts_supplied"].split(",")]
+            else:
+                r["parts_supplied"] = []
+        return rows
     
 # ─────────────────────────────────────
 # ADD functions

@@ -667,8 +667,23 @@ if prompt:
                                     st.markdown(answer)
                                 if items:
                                     for it in items[:10]:
-                                        st.markdown(f"- {it}")
-                                active_chat["messages"].append({"role": "assistant", "content": answer + ("" if not items else "\n\n" + "\n".join(f"- {x}" for x in items))})
+                                        if isinstance(it, dict):
+                                            if "name" in it:
+                                                parts = it.get("parts_supplied", [])
+                                                parts_str = ", ".join(parts) if isinstance(parts, list) else str(parts)
+                                                st.markdown(f"- **{it.get('name','')}** — {it.get('contact_name','')} ({it.get('email','')}, {it.get('phone_number','')}) — Supplies: {parts_str}")
+                                            else:
+                                                st.markdown(f"- {it}")
+                                        else:
+                                            st.markdown(f"- {it}")
+                                # store as readable message for history
+                                def _fmt(it):
+                                    if isinstance(it, dict) and "name" in it:
+                                        parts = it.get("parts_supplied", [])
+                                        parts_str = ", ".join(parts) if isinstance(parts, list) else str(parts)
+                                        return f"- {it.get('name','')} — {it.get('contact_name','')} ({it.get('email','')}) — Supplies: {parts_str}"
+                                    return f"- {it}"
+                                active_chat["messages"].append({"role": "assistant", "content": answer + ("" if not items else "\n\n" + "\n".join(_fmt(x) for x in items))})
                             except:
                                 clean = resp.strip()
                                 if clean.startswith("```"):
@@ -678,7 +693,12 @@ if prompt:
                                         st.markdown(j.get("answer", clean))
                                         if j.get("items"):
                                             for it in j["items"]:
-                                                st.markdown(f"- {it}")
+                                                if isinstance(it, dict) and "name" in it:
+                                                    parts = it.get("parts_supplied", [])
+                                                    parts_str = ", ".join(parts) if isinstance(parts, list) else str(parts)
+                                                    st.markdown(f"- **{it.get('name','')}** — {it.get('contact_name','')} ({it.get('email','')}, {it.get('phone_number','')}) — Supplies: {parts_str}")
+                                                else:
+                                                    st.markdown(f"- {it}")
                                         active_chat["messages"].append({"role": "assistant", "content": j.get("answer", clean)})
                                     except:
                                         st.markdown(clean)
@@ -701,7 +721,12 @@ if prompt:
                         st.markdown(j.get("answer", resp))
                         if j.get("items"):
                             for it in j["items"]:
-                                st.markdown(f"- {it}")
+                                if isinstance(it, dict) and "name" in it:
+                                    parts = it.get("parts_supplied", [])
+                                    parts_str = ", ".join(parts) if isinstance(parts, list) else str(parts)
+                                    st.markdown(f"- **{it.get('name','')}** — {it.get('contact_name','')} ({it.get('email','')}, {it.get('phone_number','')}) — Supplies: {parts_str}")
+                                else:
+                                    st.markdown(f"- {it}")
                         active_chat["messages"].append({"role": "assistant", "content": j.get("answer", resp)})
                         active_chat["conversation_history"].append({"role": "user", "content": prompt})
                         active_chat["conversation_history"].append({"role": "assistant", "content": resp})
