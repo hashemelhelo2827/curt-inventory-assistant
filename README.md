@@ -2,7 +2,7 @@
 
 Cairo University Racing Team (Formula Student) — Generative AI Task. Small assistant that answers natural-language questions about CURT's parts inventory, live from SQLite, via rule-based Phase 1 and LLM-powered Phase 2 with Streamlit.
 
-**Live Demo:** _Add Streamlit Cloud link after deploy_  
+**Live Demo:** [_Streamlit Cloud link _](https://curt-inventory-assistant-sywpcv8sqmm8w2djbyrvdm.streamlit.app/)  
 **Video:** _Add Google Drive link (2-5 min)_
 
 ---
