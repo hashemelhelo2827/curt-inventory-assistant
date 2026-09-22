@@ -365,19 +365,28 @@ if "chats_phase1" not in st.session_state or "chats_phase2" not in st.session_st
         st.session_state.chats_phase2[nid2] = {"id": nid2, "title": "New chat", "created_at": datetime.now().isoformat(), "updated_at": datetime.now().isoformat(), "messages": [], "conversation_history": []}
         st.session_state.active_chat_id_phase2 = nid2
         _save_store()
-    # ensure at least one chat per phase
-    if not st.session_state.chats_phase1:
-        nid = _new_chat_id()
-        st.session_state.chats_phase1[nid] = {"id": nid, "title": "New chat", "created_at": datetime.now().isoformat(), "updated_at": datetime.now().isoformat(), "messages": [], "conversation_history": []}
-        st.session_state.active_chat_id_phase1 = nid
-    if not st.session_state.chats_phase2:
-        nid = _new_chat_id()
-        st.session_state.chats_phase2[nid] = {"id": nid, "title": "New chat", "created_at": datetime.now().isoformat(), "updated_at": datetime.now().isoformat(), "messages": [], "conversation_history": []}
-        st.session_state.active_chat_id_phase2 = nid
-    if not st.session_state.active_chat_id_phase1:
-        st.session_state.active_chat_id_phase1 = list(st.session_state.chats_phase1.keys())[0]
-    if not st.session_state.active_chat_id_phase2:
-        st.session_state.active_chat_id_phase2 = list(st.session_state.chats_phase2.keys())[0]
+    # ensure at least one chat per phase + refresh-new-blank (keep old, show fresh)
+    for _pk in ["phase1", "phase2"]:
+        _chats = st.session_state[f"chats_{_pk}"]
+        _active_key = f"active_chat_id_{_pk}"
+        if not _chats:
+            nid = _new_chat_id()
+            _chats[nid] = {"id": nid, "title": "New chat", "created_at": datetime.now().isoformat(), "updated_at": datetime.now().isoformat(), "messages": [], "conversation_history": []}
+            st.session_state[_active_key] = nid
+            continue
+        _cur = st.session_state.get(_active_key)
+        if not _cur or _cur not in _chats:
+            # pick newest as fallback
+            _cur = sorted(_chats.values(), key=lambda x: x.get("updated_at",""), reverse=True)[0]["id"]
+            st.session_state[_active_key] = _cur
+        _cur_chat = _chats.get(_cur)
+        # reuse empty New chat as fresh to avoid duplicate empties; else create new blank for this refresh/session
+        if _cur_chat.get("title") == "New chat" and not _cur_chat.get("messages"):
+            pass
+        else:
+            nid = _new_chat_id()
+            _chats[nid] = {"id": nid, "title": "New chat", "created_at": datetime.now().isoformat(), "updated_at": datetime.now().isoformat(), "messages": [], "conversation_history": []}
+            st.session_state[_active_key] = nid
     _save_store()
 
 if "drawer_open" not in st.session_state:
