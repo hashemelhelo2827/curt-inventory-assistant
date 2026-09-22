@@ -13,3 +13,10 @@ database/*.db-journal
 .venv/
 venv/
 *.log
+chat_store.json
+*.png
+body_*.txt
+btns.html
+pagesource.html
+err_*.txt
+selenium_*.png
