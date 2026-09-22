@@ -61,6 +61,29 @@ def parse_question(question: str):
     elif "show all parts" in q or "list all parts" in q:
         return "all_parts", None
 
+    elif q.startswith("list ") or q.startswith("show ") or q.startswith("give ") or q.startswith("get "):
+        # hard natural list: list Brake Caliper (BRK-C-001), show brake caliper details, give me info on BRK-C-001
+        import re
+        raw = question.strip()
+        # extract part_number like BRK-C-001 even with spaces/brackets
+        m = re.search(r"[A-Z]{2,4}\s*-\s*[A-Z]\s*-\s*\d{3,4}", raw, re.I)
+        if m:
+            pn = re.sub(r"\s+", "", m.group(0)).upper()
+            return "list_by_number", pn
+        m2 = re.search(r"\(\s*([A-Z]{2,4}-[A-Z]-\d{3})\s*\)", raw, re.I)
+        if m2:
+            return "list_by_number", m2.group(1).upper()
+        # fallback: extract name after list/show/give/get
+        kw = re.sub(r"^(list|show|give|get)\s+", "", raw, flags=re.I)
+        kw = re.sub(r"^(me\s+)?(the\s+)?(info\s+)?(on\s+)?(details\s+)?(for\s+)?", "", kw, flags=re.I)
+        kw = re.sub(r"\(.*?\)", "", kw).strip()
+        # remove filler including the
+        kw = re.sub(r"\b(items|item|part|details|info|show|me|please|give|get|on|for|the)\b", "", kw, flags=re.I)
+        kw = " ".join(kw.split())
+        kw = kw.replace("?", "").strip()
+        if kw and kw.lower() not in ["all", ""]:
+            return "list_by_name", kw
+
     elif "critical parts" in q or "safety critical" in q:
         return "critical_parts", None
 
@@ -264,6 +287,23 @@ def handle_question(question: str):
         return f"Part '{keyword}' not found."
 
     elif intent == "where_is":
+        import re
+        kw = keyword.strip()
+        # handle part_number like BRK-C-001
+        if re.match(r"^[A-Z]{2,4}-[A-Z]-\d{3,4}$", kw, re.I):
+            with get_db_connection() as conn:
+                cur = conn.cursor()
+                cur.execute("""
+                    SELECT c.part_name, s.location, s.assigned_to, p.part_id, p.car_position
+                    FROM STATUS_CONDITION s
+                    JOIN PART p ON p.part_id = s.part_id
+                    JOIN CORE_PART_INFO c ON c.part_number = p.part_number
+                    WHERE UPPER(c.part_number)=UPPER(?)
+                """, (kw,))
+                results = cur.fetchall()
+            if results:
+                return "\n".join([f"{r['part_name']} ({r['part_id']} {r['car_position']}) is at '{r['location']}' assigned to {r['assigned_to']}." for r in results])
+            return f"Part number '{kw}' not found."
         with get_db_connection() as conn:
             cursor = conn.cursor()
             cursor.execute("""
@@ -271,7 +311,7 @@ def handle_question(question: str):
                 FROM STATUS_CONDITION s
                 JOIN PART p ON p.part_id = s.part_id
                 JOIN CORE_PART_INFO c ON c.part_number = p.part_number
-                WHERE LOWER(c.part_name) = ?
+                WHERE LOWER(c.part_name) = LOWER(?)
             """, (keyword,))
             results = cursor.fetchall()
         if results:
@@ -279,7 +319,20 @@ def handle_question(question: str):
             for r in results:
                 responses.append(f"{r['part_name']} ({r['part_id']} {r['car_position']}) is at '{r['location']}' assigned to {r['assigned_to']}.")
             return "\n".join(responses)
-        # misspelling fallback
+        # LIKE fallback without the, and misspelling
+        with get_db_connection() as conn:
+            cur = conn.cursor()
+            cur.execute("SELECT c.part_name FROM CORE_PART_INFO WHERE LOWER(c.part_name) LIKE LOWER(?)", (f"%{kw}%",))
+            if cur.fetchone():
+                cur.execute("""
+                    SELECT c.part_name, s.location, s.assigned_to, p.part_id, p.car_position
+                    FROM STATUS_CONDITION s
+                    JOIN PART p ON p.part_id = s.part_id
+                    JOIN CORE_PART_INFO c ON c.part_number = p.part_number
+                    WHERE LOWER(c.part_name) LIKE LOWER(?)
+                """, (f"%{kw}%",))
+                rows = cur.fetchall()
+                return "\n".join([f"{r['part_name']} ({r['part_id']} {r['car_position']}) is at '{r['location']}' assigned to {r['assigned_to']}." for r in rows])
         import difflib
         all_names = get_all_parts_name()
         close = difflib.get_close_matches(keyword, all_names, n=1, cutoff=0.5)
@@ -307,6 +360,60 @@ def handle_question(question: str):
                 lines.append(f"  - {name} ({pn}) — {total} units total: {positions}")
             return f"Parts in {keyword.title()}:\n" + "\n".join(lines)
         return f"No parts found in category '{keyword}'."
+
+    elif intent == "list_by_number":
+        # keyword is part_number like BRK-C-001
+        from agent.tools.databaseserver.databasetools import get_by_part_number as _gpn
+        results = _gpn(keyword.upper())
+        if results:
+            # group like list_category but for single part_number
+            lines = []
+            for r in results:
+                lines.append(f"  - {r['part_name']} ({r['part_number']}) [{r['car_position']} {r['part_id']}] qty:{r['quantity']} {r['category']}")
+            return f"Details for {keyword.upper()}:\n" + "\n".join(lines)
+        # try difflib for close part_number
+        import difflib
+        with get_db_connection() as conn:
+            cur = conn.cursor()
+            cur.execute("SELECT part_number FROM CORE_PART_INFO")
+            all_pn = [row["part_number"] for row in cur.fetchall()]
+            close = difflib.get_close_matches(keyword.upper(), all_pn, n=1, cutoff=0.6)
+            if close:
+                return f"Part number '{keyword}' not found. Did you mean '{close[0]}'?"
+        return f"Part number '{keyword}' not found."
+
+    elif intent == "list_by_name":
+        kw = keyword.strip()
+        # try exact part_name
+        with get_db_connection() as conn:
+            cur = conn.cursor()
+            cur.execute("SELECT p.part_id, c.part_number, c.part_name, c.quantity, c.category, p.car_position FROM PART p JOIN CORE_PART_INFO c ON p.part_number=c.part_number WHERE LOWER(c.part_name)=LOWER(?)", (kw,))
+            rows = cur.fetchall()
+            if rows:
+                lines = [f"  - {r['part_name']} ({r['part_number']}) [{r['car_position']} {r['part_id']}] qty:{r['quantity']}" for r in rows]
+                return f"Details for '{kw}':\n" + "\n".join(lines)
+            # LIKE fallback for partial without , or /
+            cur.execute("SELECT p.part_id, c.part_number, c.part_name, c.quantity, c.category, p.car_position FROM PART p JOIN CORE_PART_INFO c ON p.part_number=c.part_number WHERE LOWER(c.part_name) LIKE LOWER(?)", (f"%{kw}%",))
+            rows = cur.fetchall()
+            if rows:
+                # group by part_number
+                from collections import defaultdict
+                grouped = defaultdict(list)
+                for r in rows:
+                    grouped[r["part_number"]].append(r)
+                lines = []
+                for pn, lst in grouped.items():
+                    name = lst[0]["part_name"]
+                    qty = lst[0]["quantity"]
+                    pos = ", ".join([f"{x['car_position']} ({x['part_id']})" for x in lst])
+                    lines.append(f"  - {name} ({pn}) — {qty} units: {pos}")
+                return f"Details for '{kw}':\n" + "\n".join(lines)
+            import difflib
+            all_names = get_all_parts_name()
+            close = difflib.get_close_matches(kw, all_names, n=1, cutoff=0.5)
+            if close:
+                return f"Part '{kw}' not found. Did you mean '{close[0]}'?"
+            return f"Part '{kw}' not found."
 
     elif intent == "all_parts":
         results = get_all_parts()
