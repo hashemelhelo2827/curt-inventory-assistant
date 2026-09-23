@@ -1,5 +1,6 @@
 import sys
 import os
+from datetime import datetime, timedelta
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from helper import (
@@ -241,14 +242,18 @@ def add_part(part_number: str, part_name: str, category: str,
 
 
 @mcp.tool()
-def add_physical_unit(part_id: str, part_number: str, car_position: str,
-                      compatible_with: str, condition: str, location: str,
-                      assigned_to: str, date_acquired: str,
-                      next_inspection_due: str, max_usage_cycles: int,
-                      critical_part: bool):
+def add_physical_unit(part_id: str, part_number: str, car_position: str = "Spare",
+                      compatible_with: str = "2024 CURT-01", condition: str = "New", location: str = "Workshop",
+                      assigned_to: str = None, date_acquired: str = None,
+                      next_inspection_due: str = None, max_usage_cycles: int = 100,
+                      critical_part: bool = True):
     """Add a new physical unit — inserts into PART, STATUS_CONDITION
     and LIFECYCLE_TRACKING in one go. Use existing part_number like BRK-D-001 for Brake Disc, generate new unique part_id like PRT-007. Even if a unit with same part_number+car_position exists, this creates an additional physical unit (inventory can have multiple). Valid conditions: New, Used, Damaged, Under Repair
     """
+    if date_acquired is None:
+        date_acquired = datetime.now().strftime("%Y-%m-%d")
+    if next_inspection_due is None:
+        next_inspection_due = (datetime.now() + timedelta(days=30)).strftime("%Y-%m-%d")
     with get_db_connection() as conn:
         cursor = conn.cursor()
         _insert_part(cursor, part_id, part_number, car_position, compatible_with)
