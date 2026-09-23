@@ -248,7 +248,7 @@ def add_physical_unit(part_id: str, part_number: str, car_position: str = "Spare
                       next_inspection_due: str = None, max_usage_cycles: int = 100,
                       critical_part: bool = True):
     """Add a new physical unit — inserts into PART, STATUS_CONDITION
-    and LIFECYCLE_TRACKING in one go. Use existing part_number like BRK-D-001 for Brake Disc, generate new unique part_id like PRT-007. Even if a unit with same part_number+car_position exists, this creates an additional physical unit (inventory can have multiple). Valid conditions: New, Used, Damaged, Under Repair
+    and LIFECYCLE_TRACKING in one go. Use existing part_number like BRK-D-001 for Brake Disc. Caller should determine next available part_id by calling get_all_parts and computing max numeric PRT + 1 (e.g., if max is PRT-013, next is PRT-014); never reuse PRT-007 if taken. If provided part_id already exists, tool will auto-generate next available PRT-xxx and succeed. Even if a unit with same part_number+car_position exists, this creates an additional physical unit (inventory can have multiple). Valid conditions: New, Used, Damaged, Under Repair
     """
     if date_acquired is None:
         date_acquired = datetime.now().strftime("%Y-%m-%d")
@@ -256,12 +256,55 @@ def add_physical_unit(part_id: str, part_number: str, car_position: str = "Spare
         next_inspection_due = (datetime.now() + timedelta(days=30)).strftime("%Y-%m-%d")
     with get_db_connection() as conn:
         cursor = conn.cursor()
-        _insert_part(cursor, part_id, part_number, car_position, compatible_with)
-        _insert_status_condition(cursor, part_id, condition, location, assigned_to)
-        _insert_lifecycle_tracking(cursor, part_id, date_acquired, 
-                                   next_inspection_due, max_usage_cycles, critical_part)
-        conn.commit()
-        return {"success": True, "part_id": part_id}
+        # validate part_number exists
+        cursor.execute("SELECT part_number FROM CORE_PART_INFO WHERE part_number = ?", (part_number,))
+        if not cursor.fetchone():
+            return {"success": False, "error": f"part_number '{part_number}' not found", "part_id": part_id}
+        # handle duplicate part_id -> auto-generate next available
+        cursor.execute("SELECT part_id FROM PART WHERE part_id = ?", (part_id,))
+        actual_part_id = part_id
+        if cursor.fetchone():
+            cursor.execute("SELECT part_id FROM PART")
+            max_num = 0
+            for r in cursor.fetchall():
+                try:
+                    num = int(r["part_id"].split("-")[1])
+                    if num > max_num:
+                        max_num = num
+                except:
+                    pass
+            next_num = max_num + 1
+            while True:
+                candidate = f"PRT-{next_num:03d}"
+                cursor.execute("SELECT 1 FROM PART WHERE part_id = ?", (candidate,))
+                if not cursor.fetchone():
+                    actual_part_id = candidate
+                    break
+                next_num += 1
+        try:
+            _insert_part(cursor, actual_part_id, part_number, car_position, compatible_with)
+            _insert_status_condition(cursor, actual_part_id, condition, location, assigned_to)
+            _insert_lifecycle_tracking(cursor, actual_part_id, date_acquired, 
+                                       next_inspection_due, max_usage_cycles, critical_part)
+            conn.commit()
+        except Exception as e:
+            # fallback: if still duplicate due to race, compute again
+            if "UNIQUE" in str(e) or "unique" in str(e).lower():
+                cursor.execute("SELECT part_id FROM PART")
+                max_num = 0
+                for r in cursor.fetchall():
+                    try:
+                        num = int(r["part_id"].split("-")[1])
+                        if num > max_num:
+                            max_num = num
+                    except:
+                        pass
+                actual_part_id = f"PRT-{max_num+1:03d}"
+                return {"success": False, "error": str(e), "next_id": actual_part_id}
+            return {"success": False, "error": str(e), "part_id": actual_part_id}
+        if actual_part_id != part_id:
+            return {"success": True, "part_id": actual_part_id, "note": f"requested {part_id} already exists, auto-generated {actual_part_id}"}
+        return {"success": True, "part_id": actual_part_id}
 
 
 @mcp.tool()

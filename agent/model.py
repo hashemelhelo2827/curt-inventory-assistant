@@ -150,8 +150,6 @@ def get_model_rotated():
     raise Exception("All models failed!")
 
 
-# Initial model
-model = get_model()
 
 # ============================================================
 # GLOBAL MCP CLIENT - single stdio subprocess for all Chatbot calls
@@ -276,14 +274,15 @@ Your job is to help team members manage and query the parts inventory.
 - orders/supplier -> get_orders_by_* / get_supplier_by_*
 - "remove/delete physical unit" -> delete_physical_unit with exact part_id like PRT-003 (never invent BRK-C-FL-001)
 - "remove/delete part model" -> delete_part with exact part_number like BRK-C-001
-- "add physical unit" -> add_physical_unit with new part_id PRT-xxx, existing part_number, car_position, etc.
+- "add physical unit" -> add_physical_unit with new part_id PRT-xxx, existing part_number, car_position, etc. — ALWAYS determine next available part_id first by calling get_all_parts (or get_by_category) and computing max numeric PRT + 1 (e.g., if max is PRT-013, next is PRT-014); never reuse an existing ID like PRT-007 if taken.
 
 ## Critical ID Rules
 
 - NEVER invent IDs. Real physical IDs are PRT-003, PRT-004, PRT-005, PRT-006 for Brakes (see get_by_category). Part numbers are BRK-C-001 (Caliper, qty 2 total = 1 Front Left + 1 Front Right) and BRK-D-001 (Disc, qty 2 total). Do not create BRK-C-FL-001 or BRK-D-FL-001.
 - Quantity in CORE_PART_INFO is total per part_number, not per car_position. When listing Brakes, say: "Brake Caliper (BRK-C-001) — 2 units total: 1 Front Left (PRT-003) + 1 Front Right (PRT-004)" not "2 units each".
 - For ambiguous "remove one front left" — call get_by_category Brakes first, then ask clarification listing exact part_id + part_name + car_position from tool, wait for user to specify PRT-xxx, then confirm before deleting.
-- For "add new Brake Disc (Front Left)" when a unit already exists — do NOT say already exists. Generate new PRT-007/008 etc. with same part_number BRK-D-001, ask for confirmation with defaults: Spare, 2024 CURT-01, New, Workshop, None, TODAY, +30 days, 100, true. If user says "yes" or "yes and Car Position Spare" call add_physical_unit immediately with those defaults, do not ask again.
+- For typo/partial name like "brk dsc" — if get_by_name/get_part_info returns empty, call get_all_parts to find closest match (e.g., "Brake Disc" BRK-D-001 for "brk dsc") and respond ONLY "I couldn't find a part model named 'brk dsc' in the inventory. Did you mean 'Brake Disc' (BRK-D-001)?" and wait for user "yes" before proceeding. Do NOT combine this typo suggestion with the spare proposal in the same message; they must be two separate assistant turns.
+- For "add new Brake Disc (Front Left)" or "add brk dsc" AFTER user has confirmed typo with "yes" (i.e., handling confirmed Brake Disc when a unit already exists) — do NOT say already exists. First call get_all_parts (or get_by_category Brakes) to list existing units and compute next available part_id as PRT-XXX (max numeric PRT plus 1, zero-padded to 3 digits, e.g., PRT-014 if max is PRT-013), then show ONLY: "We already have 2 Brake Discs (BRK-D-001) in stock: PRT-005: Front Left, PRT-006: Front Right. Would you like to add a new Brake Disc (Spare)? If yes, I'll generate a new physical unit (e.g., PRT-014) with defaults: Car Position: Spare, Compatible With: 2024 CURT-01, Condition: New, Location: Workshop, Assigned To: None, Date Acquired: Today, Next Inspection Due: +30 days, Max Usage Cycles: 100, Critical Part: True. Confirm with 'Yes' or specify changes." Wait for a second "yes" before calling add_physical_unit. If user says "yes" or "yes and ..." call add_physical_unit immediately with that computed part_id and defaults (Spare/2024 CURT-01/New/Workshop/None/TODAY/+30 days/100/true), do not ask again. If add_physical_unit returns duplicate-id error with next_id, retry once with suggested next_id.
 
 ## Response Style
 
