@@ -10,22 +10,20 @@ Cairo University Racing Team (Formula Student) — Generative AI Task. Small ass
 ## Architecture
 
 ```
-Streamlit (streamlit_app.py) — pure frontend, no direct DB/MCP (PDF p3 Security)
-    │  POST /chat {message, phase, history}  →  Flask backend/app.py:21 (POST /chat)
-    │  GET /inventory                          →  Flask backend/app.py:46 (GET /inventory)
-    └─ phase toggle ─┘                            │
-                   Backend Flask (single source) ─┤
-                        ├─ phase1: phase1/assistant_phase1.py (rule-based parser, no LLM)
-                        └─ phase2: agent/model.py (MCP + Mistral) ── MCP stdio → agent/tools/databaseserver/databasetools.py
-                                                                └─ helper.py → database/curt_inventory.db (SQLite)
+Streamlit (streamlit_app.py)
+   ├─ Phase 1 toggle → phase1/assistant_phase1.py (keyword parser, no LLM)
+   └─ Phase 2 toggle → agent/model.py (MCP + Mistral) ──┐
+                                                          ├─ MCP stdio → agent/tools/databaseserver/databasetools.py
+                                                          │              └─ helper.py → database/curt_inventory.db (SQLite)
+                                                          └─ Fallback → backend/app.py POST /chat (Flask + flask_session)
 
-Inventory tables: CORE_PART_INFO (part_number, part_name, quantity, category) + PART + STATUS_CONDITION + LIFECYCLE_TRACKING + ORDERS + SUPPLIER_INFO
+Inventory table: CORE_PART_INFO (part_number, part_name, quantity, category) + PART + STATUS_CONDITION + LIFECYCLE_TRACKING + ORDERS + SUPPLIER_INFO
 ```
 
-- **Streamlit** pure frontend `streamlit_app.py` — chat + `chat_input`/`chat_message` scrolling, per-chat drawer `chat_store.json` + `localStorage`, toggle `Phase 1/2` without restart, sidebar live table via `GET /inventory` `BACKEND_URL` `streamlit_app.py:434`, supplier message formatting. No `from agent.model import Chatbot`, no direct `sqlite` — PDF p3 `LLM must not have direct access to DB`.
-- **Backend** Flask **mandatory** `POST /chat` (`{message, phase, history}` + `flask_session` cookie → `Chatbot` → `{"response": str, "history": list}`) and `GET|POST /inventory` + `GET /health` `backend/app.py:46`. Conversation memory `flask_session` filesystem per-session + `MAX_HISTORY=20` `agent/model.py:308` for follow-up `Where are they stored?` after `How many brake pads?` PDF p4.
-- **MCP Tools** `databasetools.py` via `MultiServerMCPClient` `agent/model.py:165` `DATABASE_TOOLS` stdio `python agent/tools/databaseserver/databasetools.py`. Tools: `get_by_name`, `get_by_part_number`, `get_by_category`, `get_part_status` (where is), `get_part_info` (how many), `get_all_parts`, `get_all_categories`, `get_all_suppliers`, `get_orders_by_*`, `get_supplier_by_*`, `get_low_stock(threshold)`, `flag_shortage(item_name, threshold=2)` (logs `LOW STOCK FLAG`, per spec), `get_critical_parts`, `get_due_inspections`.
-- **LLM** Mistral `open-mistral-nemo` / `mistral-tiny` `https://api.mistral.ai/v1` `ChatOpenAI` `agent/model.py:23` `model_kwargs={"parallel_tool_calls": True}`. `SYSTEM_PROMPT` Rule 9 `may chain`, `recursion_limit:12` `agent/model.py:373`, `global _loop` `backend/app.py:18` + `global _global_mcp_client` `agent/model.py:159` single `TaskGroup` (avoids per-turn spawn/close race).
+- **Streamlit** chat + sidebar live table (`_fetch_all_parts` helper.py:6) — single-page, chat_input + scrolling chat_message, toggle Phase 1/2 without restart, supplier message formatting `streamlit_app.py:668`.
+- **Backend** Flask `POST /chat` (message + session/history → Chatbot → response) and `GET|POST /inventory` (`_fetch_all_parts`) `backend/app.py:46` dual for spec. Conversation memory `flask_session` filesystem + `MAX_HISTORY=20` `agent/model.py:306` (was 5, now 20 for longer follow-ups).
+- **MCP Tools** `databasetools.py` via `MultiServerMCPClient` `agent/model.py:259` `DATABASE_TOOLS` stdio `python agent/tools/databaseserver/databasetools.py`. Tools: `get_by_name`, `get_by_part_number`, `get_by_category`, `get_part_status` (where is), `get_part_info` (how many), `get_all_parts`, `get_all_categories`, `get_all_suppliers` (suppliers + parts_supplied), `get_orders_by_*`, `get_supplier_by_*`, `get_low_stock(threshold)`, `flag_shortage(item_name, threshold=2)` (logs `LOW STOCK FLAG`, per spec), `get_critical_parts`, `get_due_inspections`, plus add/update/delete.
+- **LLM** Mistral `open-mistral-nemo` / `mistral-tiny` via `https://api.mistral.ai/v1` `ChatOpenAI` `agent/model.py:23` `model_kwargs={"parallel_tool_calls": True}`. Multi-tool chaining enabled `SYSTEM_PROMPT` Rule 9 `may chain`, `recursion_limit:12` `agent/model.py:373`, `global _loop` `backend/app.py:19` / `streamlit_app.py:24` to avoid `Event loop is closed` (httpx/anyio).
 
 ## Tech Stack
 
@@ -55,16 +53,13 @@ copy .env.example .env
 # To re-seed:
 python -c "import sqlite3; print('DB at database/curt_inventory.db with', sqlite3.connect('database/curt_inventory.db').execute('SELECT COUNT(*) FROM CORE_PART_INFO').fetchone()[0], 'parts')"
 
-# 5. Run backend (required — PDF p3 LLM not direct DB, Streamlit is pure frontend)
+# 5. Run backend (optional - Streamlit can call Chatbot directly)
 $env:PYTHONPATH="."; python backend/app.py
-# -> http://0.0.0.0:5000 (Railway uses $PORT)
+# -> http://127.0.0.1:5000
 
-# 6. Run Streamlit (needs backend up)
-# Set BACKEND_URL if not default
-$env:BACKEND_URL="http://127.0.0.1:5000"; streamlit run streamlit_app.py
-# -> http://localhost:8501 (calls backend POST /chat + GET /inventory)
-# Verify backend: curl http://127.0.0.1:5000/health -> {"status":"ok"}
-#               curl http://127.0.0.1:5000/inventory -> {"status":"success","parts": [...]}
+# 6. Run Streamlit
+streamlit run streamlit_app.py
+# -> http://localhost:8501
 ```
 
 ## API Endpoints
@@ -102,21 +97,12 @@ LLM decides via `SYSTEM_PROMPT` Tool Routing `agent/model.py:267` + `parallel_to
 - **Misspelling/partial:** `brak caliper` → `get_part_info` strips trailing `s` and uses `LOWER(?)` IN `(?, singular)` → `2 Brake Calipers` (handles `brake calipers`/`brake caliper`).
 - **Ambiguous/no item:** `how many do we have?` → uses `conversation_history` `MAX_HISTORY=20` `agent/model.py:306` to resolve from prior `brake calipers` context → same answer, not `Event loop is closed`.
 - **API limits:** `mistral-small` hit `429 code 1300 RPM 0/0`; switched to `nemo`/`tiny` `188/625k`. `helper.py` returns `[dict(row)]` to avoid `<sqlite3.Row object>` dump.
-- **Event loop:** Global `_loop` `backend/app.py:18` + `global _global_mcp_client` single `TaskGroup` `agent/model.py:159` + fresh `get_model()` per Chatbot call `agent/model.py:337` fixes `Event loop is closed` (httpx/anyio). Streamlit no longer has own `_loop` (PDF p3 proxy).
+- **Event loop:** Global `_loop` backend/app.py:19 + streamlit_app.py:24 + fresh `get_model()` per Chatbot call agent/model.py:349 fixes `Event loop is closed` (httpx/anyio).
 
-## Deployment — Railway Full-Stack (Option B, Bonus p5)
+## Streamlit Deployment (Bonus)
 
-**Local is required, Railway is bonus — README must explain both.**
-
-- **Railway (recommended, PDF p3 compliant):** Single repo, **2 services** from same GitHub:
-  1. `curt-backend`: Root `.` Start `python backend/app.py` Env `Mistral_API_key`, `Mistral_API_key2`, `SECRET_KEY` Domain `curt-backend.up.railway.app` Health `GET /health` `railway.json:5` Nixpacks, `Procfile: web: python backend/app.py` `runtime.txt python-3.11`
-  2. `curt-frontend`: Root `.` Start `streamlit run streamlit_app.py --server.port $PORT --server.address 0.0.0.0` Env `BACKEND_URL=https://curt-backend.up.railway.app` Domain `curt-frontend.up.railway.app`
-  Railway private networking also works: `BACKEND_URL=http://${{curt-backend.RAILWAY_PRIVATE_DOMAIN}}:5000`
-  Single-service fallback: `Procfile` `web: python backend/app.py & streamlit run streamlit_app.py --server.port $PORT --server.address 0.0.0.0` with backend on `5000` inner, Streamlit on `$PORT` outer, frontend `BACKEND_URL=http://127.0.0.1:5000`.
-
-- **Streamlit Cloud (if you prefer):** Deploy backend to Railway as above, set Streamlit Cloud Secrets `BACKEND_URL=https://curt-backend.up.railway.app` (Streamlit is pure HTTP, no `Mistral_API_key` needed on frontend). Streamlit Cloud alone cannot run Flask — must proxy to Railway backend.
-
-- **Health checks:** `GET /health -> ok`, `GET /inventory -> parts`.
+- **Streamlit Cloud:** New app → GitHub `curt-inventory-assistant` → `streamlit_app.py` → Secrets: `Mistral_API_key`, `Mistral_API_key2`.
+- No backend needed separately — Streamlit calls `agent/model.py` direct via `_loop`. Backend optional for `POST /chat` API demo.
 
 ## Reflection (Task 6)
 
