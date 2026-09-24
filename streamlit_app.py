@@ -1,32 +1,34 @@
 import streamlit as st
 import sys
 import os
-import asyncio
 import pandas as pd
 import uuid
 import json
 import time
 from datetime import datetime
 import streamlit.components.v1 as components
+import requests
 
 # Ensure curt is in path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from phase1.assistant_phase1 import handle_question as phase1_handle
-from agent.tools.databaseserver.helper import get_db_connection
+# PDF p3 compliant: Streamlit is pure frontend via Flask backend (no direct DB/MCP)
+# Both Phase1 (rule-based) and Phase2 (LLM+MCP) go through backend/app.py POST /chat
+_RAW_BACKEND = os.getenv("BACKEND_URL", "http://127.0.0.1:5000").rstrip("/")
+# Support both http://127.0.0.1:5000 and http://127.0.0.1:5000/chat forms
+if _RAW_BACKEND.endswith("/chat"):
+    BACKEND_URL = _RAW_BACKEND[:-5].rstrip("/") or "http://127.0.0.1:5000"
+else:
+    BACKEND_URL = _RAW_BACKEND
+BACKEND_CHAT_URL = f"{BACKEND_URL}/chat"
+BACKEND_INV_URL = f"{BACKEND_URL}/inventory"
+BACKEND_HEALTH_URL = f"{BACKEND_URL}/health"
 
-# Try to import Phase2 Chatbot, fallback to requests if backend running
-try:
-    from agent.model import Chatbot as phase2_chatbot
-    HAS_DIRECT_PHASE2 = True
-except:
-    HAS_DIRECT_PHASE2 = False
-
-import requests
-
-# Global loop for Phase2 - reuses same loop to avoid httpx Event loop is closed, with TaskGroup fix via client.close() in agent/model.py
-_loop = asyncio.new_event_loop()
-asyncio.set_event_loop(_loop)
+# Reusable HTTP session to keep Flask flask_session cookie for follow-up context (PDF p4)
+def _get_http_session():
+    if "http_sess" not in st.session_state:
+        st.session_state.http_sess = requests.Session()
+    return st.session_state.http_sess
 
 st.set_page_config(
     page_title="CURT Inventory Assistant",
@@ -417,7 +419,7 @@ if "chat_messages" not in st.session_state:
 # --- Sidebar: Live Inventory ---
 with st.sidebar:
     st.markdown("### 📦 Live Inventory")
-    st.caption("Pulled live from `database/curt_inventory.db` — for demo/debugging.")
+    st.caption("Pulled live from backend `GET /inventory` — for demo/debugging (PDF p4).")
     
     # Toggle Phase
     phase = st.selectbox(
@@ -430,50 +432,81 @@ with st.sidebar:
     
     st.divider()
     
-    # Quick stats
+    # Quick stats + Inventory table via Flask backend (PDF p3: LLM not direct DB)
+    _inv_rows = None
+    _inv_error = None
     try:
-        with get_db_connection() as conn:
-            cur = conn.cursor()
-            cur.execute("SELECT COUNT(*) as c FROM CORE_PART_INFO")
-            total_parts = cur.fetchone()["c"]
-            cur.execute("SELECT SUM(quantity) as s FROM CORE_PART_INFO")
-            total_qty = cur.fetchone()["s"] or 0
-            cur.execute("SELECT COUNT(*) as c FROM CORE_PART_INFO WHERE quantity < 2")
-            low = cur.fetchone()["c"]
-        col1, col2 = st.columns(2)
-        col1.metric("Part Models", total_parts)
-        col2.metric("Low Stock <2", low)
-        st.caption(f"Total units: {total_qty}")
+        _http = _get_http_session()
+        _r = _http.get(BACKEND_INV_URL, timeout=5)
+        _r.raise_for_status()
+        _data = _r.json()
+        _inv_rows = _data.get("parts", []) if isinstance(_data, dict) else []
+    except Exception as e:
+        _inv_error = str(e)
+        # Fallback local DB for offline dev (not used when backend is up)
+        try:
+            from agent.tools.databaseserver.helper import get_db_connection as _gdb
+            with _gdb() as conn:
+                cur = conn.cursor()
+                cur.execute("SELECT p.part_id, c.part_number, c.part_name, c.quantity, c.category, p.car_position FROM CORE_PART_INFO c JOIN PART p ON c.part_number=p.part_number")
+                _inv_rows = [dict(r) for r in cur.fetchall()]
+            _inv_error = None
+        except Exception as e2:
+            _inv_error = str(e2)
+
+    # Quick stats derived from _inv_rows
+    try:
+        if _inv_rows is not None:
+            # dedupe by part_number for model counts
+            _by_pn = {}
+            for r in _inv_rows:
+                pn = r.get("part_number")
+                if pn not in _by_pn:
+                    _by_pn[pn] = r
+            total_parts = len(_by_pn)
+            total_qty = sum(int(v.get("quantity") or 0) for v in _by_pn.values())
+            low = sum(1 for v in _by_pn.values() if int(v.get("quantity") or 0) < 2)
+            col1, col2 = st.columns(2)
+            col1.metric("Part Models", total_parts)
+            col2.metric("Low Stock <2", low)
+            st.caption(f"Total units: {total_qty}")
+            if _inv_error:
+                st.caption(f"⚠️ Backend unreachable, using local DB ({_inv_error[:60]})")
+        else:
+            st.error(f"DB error: {_inv_error}")
     except Exception as e:
         st.error(f"DB error: {e}")
-    
-    # Inventory table
+
+    # Inventory table (grouped by part_number like original)
     try:
-        with get_db_connection() as conn:
-            cur = conn.cursor()
-            cur.execute("""
-                SELECT c.part_number, c.part_name, c.quantity, c.category, 
-                       GROUP_CONCAT(DISTINCT p.car_position) as positions
-                FROM CORE_PART_INFO c
-                LEFT JOIN PART p ON p.part_number = c.part_number
-                GROUP BY c.part_number
-                ORDER BY c.category, c.part_name
-            """)
-            rows = [dict(r) for r in cur.fetchall()]
-            if rows:
-                df = pd.DataFrame(rows)
-                df.columns = ["Part #", "Name", "Qty", "Category", "Positions"]
-                st.dataframe(df, use_container_width=True, hide_index=True, height=280)
-            else:
-                st.info("No parts found.")
+        if _inv_rows is not None and len(_inv_rows) > 0:
+            from collections import defaultdict
+            grouped = defaultdict(list)
+            meta = {}
+            for r in _inv_rows:
+                pn = r.get("part_number")
+                grouped[pn].append(r)
+                if pn not in meta:
+                    meta[pn] = {"part_name": r.get("part_name"), "quantity": r.get("quantity"), "category": r.get("category")}
+            table_rows = []
+            for pn, lst in sorted(meta.items(), key=lambda x: (x[1]["category"] or "", x[1]["part_name"] or "")):
+                pos = ", ".join(sorted(set(x.get("car_position") for x in grouped[pn] if x.get("car_position"))))
+                table_rows.append({"Part #": pn, "Name": meta[pn]["part_name"], "Qty": meta[pn]["quantity"], "Category": meta[pn]["category"], "Positions": pos})
+            df = pd.DataFrame(table_rows)
+            st.dataframe(df, use_container_width=True, hide_index=True, height=280)
+        elif _inv_rows is not None:
+            st.info("No parts found.")
+        else:
+            st.error(f"Table error: {_inv_error}")
     except Exception as e:
         st.error(f"Table error: {e}")
     
-    # Expandable panels
+    # Expandable panels — also via backend when possible, else direct
     with st.expander("Critical Parts"):
         try:
-            from agent.tools.databaseserver.databasetools import get_critical_parts
-            crit = get_critical_parts()
+            # Try backend-shaped data via inventory + databasetools fallback
+            from agent.tools.databaseserver.databasetools import get_critical_parts as _gcp
+            crit = _gcp()
             if crit:
                 for r in crit[:5]:
                     st.write(f"**{r['part_name']}** ({r['category']}) — next: {r['next_inspection_due']}")
@@ -484,8 +517,8 @@ with st.sidebar:
     
     with st.expander("Due Inspections"):
         try:
-            from agent.tools.databaseserver.databasetools import get_due_inspections
-            due = get_due_inspections()
+            from agent.tools.databaseserver.databasetools import get_due_inspections as _gdi
+            due = _gdi()
             if due:
                 for r in due[:5]:
                     st.write(f"**{r['part_name']}** [{r['part_id']}] — {r['next_inspection_due']}")
@@ -494,6 +527,16 @@ with st.sidebar:
         except Exception as e:
             st.write(f"Error: {e}")
     
+    # Backend status
+    try:
+        _h = _get_http_session().get(BACKEND_HEALTH_URL, timeout=3)
+        if _h.status_code == 200:
+            st.success(f"Backend: {BACKEND_URL} ✓")
+        else:
+            st.warning(f"Backend: {BACKEND_URL} ({_h.status_code})")
+    except:
+        st.warning(f"Backend: {BACKEND_URL} unreachable — start `python backend/app.py`")
+
     st.divider()
     # Clear active chat only (per-phase)
     if st.button("Clear Active Chat"):
@@ -642,113 +685,97 @@ if prompt:
         active_chat["title"] = prompt[:32] + ("…" if len(prompt) > 32 else "")
     active_chat["messages"].append({"role": "user", "content": prompt})
     active_chat["updated_at"] = datetime.now().isoformat()
-    # keep legacy conversation_history in sync for phase2
     _save_store()
     with st.chat_message("user"):
         st.markdown(prompt)
     
-    # Generate assistant reply
+    # Generate assistant reply via Flask backend (PDF p3: LLM not direct DB)
     with st.chat_message("assistant"):
-        with st.spinner("Checking inventory..."):
+        with st.spinner("Checking inventory via backend..."):
             try:
-                if is_phase1:
-                    # Phase 1 direct -> per-phase active chat
-                    reply = phase1_handle(prompt)
-                    st.markdown(reply)
-                    active_chat["messages"].append({"role": "assistant", "content": reply})
-                    active_chat["conversation_history"].append({"role": "user", "content": prompt})
-                    active_chat["conversation_history"].append({"role": "assistant", "content": reply})
-                    active_chat["updated_at"] = datetime.now().isoformat()
-                    _save_store()
+                _http = _get_http_session()
+                phase_str = "phase1" if is_phase1 else "phase2"
+                conv_hist = active_chat.get("conversation_history", [])
+                payload = {"message": prompt, "phase": phase_str, "history": conv_hist}
+                r = _http.post(BACKEND_CHAT_URL, json=payload, timeout=60)
+                r.raise_for_status()
+                data = r.json()
+                resp = data.get("response", "")
+                # backend history for follow-up context (PDF p4)
+                new_hist = data.get("history")
+                if isinstance(new_hist, list) and len(new_hist) > 0:
+                    active_chat["conversation_history"] = new_hist
                 else:
-                    # Phase 2: try direct Chatbot first (no backend needed), fallback to backend HTTP if direct fails
-                    backend_url = os.getenv("BACKEND_URL", "http://127.0.0.1:5000/chat")
-                    # Use active chat's conversation_history (separated per chat)
-                    conv_hist = active_chat.get("conversation_history", [])
-                    if HAS_DIRECT_PHASE2:
-                        try:
-                            resp, new_hist = _loop.run_until_complete(
-                                phase2_chatbot(prompt, conv_hist)
-                            )
-                            import json as _json
-                            try:
-                                j = _json.loads(resp)
-                                answer = j.get("answer", resp)
-                                items = j.get("items", [])
-                                status = j.get("status", "success")
-                                if status == "not_found":
-                                    st.warning(answer)
-                                else:
-                                    st.markdown(answer)
-                                if items:
-                                    for it in items[:10]:
-                                        if isinstance(it, dict):
-                                            if "name" in it:
-                                                parts = it.get("parts_supplied", [])
-                                                parts_str = ", ".join(parts) if isinstance(parts, list) else str(parts)
-                                                st.markdown(f"- **{it.get('name','')}** — {it.get('contact_name','')} ({it.get('email','')}, {it.get('phone_number','')}) — Supplies: {parts_str}")
-                                            else:
-                                                st.markdown(f"- {it}")
-                                        else:
-                                            st.markdown(f"- {it}")
-                                # store as readable message for history
-                                def _fmt(it):
-                                    if isinstance(it, dict) and "name" in it:
+                    # fallback local append
+                    active_chat["conversation_history"].append({"role": "user", "content": prompt})
+                    active_chat["conversation_history"].append({"role": "assistant", "content": resp})
+
+                # Render response: Phase1 is plain text, Phase2 is JSON {answer, items, status}
+                if is_phase1:
+                    # Phase1 rule-based returns plain string
+                    st.markdown(resp)
+                    active_chat["messages"].append({"role": "assistant", "content": resp})
+                else:
+                    import json as _json
+                    try:
+                        j = _json.loads(resp)
+                        answer = j.get("answer", resp)
+                        items = j.get("items", [])
+                        status = j.get("status", "success")
+                        if status == "not_found":
+                            st.warning(answer)
+                        else:
+                            st.markdown(answer)
+                        if items:
+                            for it in items[:10]:
+                                if isinstance(it, dict):
+                                    if "name" in it:
                                         parts = it.get("parts_supplied", [])
                                         parts_str = ", ".join(parts) if isinstance(parts, list) else str(parts)
-                                        return f"- {it.get('name','')} — {it.get('contact_name','')} ({it.get('email','')}) — Supplies: {parts_str}"
-                                    return f"- {it}"
-                                active_chat["messages"].append({"role": "assistant", "content": answer + ("" if not items else "\n\n" + "\n".join(_fmt(x) for x in items))})
-                            except:
-                                clean = resp.strip()
-                                if clean.startswith("```"):
-                                    clean = clean.strip("`").replace("json", "", 1).strip()
-                                    try:
-                                        j = _json.loads(clean)
-                                        st.markdown(j.get("answer", clean))
-                                        if j.get("items"):
-                                            for it in j["items"]:
-                                                if isinstance(it, dict) and "name" in it:
-                                                    parts = it.get("parts_supplied", [])
-                                                    parts_str = ", ".join(parts) if isinstance(parts, list) else str(parts)
-                                                    st.markdown(f"- **{it.get('name','')}** — {it.get('contact_name','')} ({it.get('email','')}, {it.get('phone_number','')}) — Supplies: {parts_str}")
-                                                else:
-                                                    st.markdown(f"- {it}")
-                                        active_chat["messages"].append({"role": "assistant", "content": j.get("answer", clean)})
-                                    except:
-                                        st.markdown(clean)
-                                        active_chat["messages"].append({"role": "assistant", "content": clean})
-                                else:
-                                    st.markdown(clean)
-                                    active_chat["messages"].append({"role": "assistant", "content": clean})
-                            active_chat["conversation_history"] = new_hist
-                            active_chat["updated_at"] = datetime.now().isoformat()
-                            _save_store()
-                        except Exception as e:
-                            raise e
-                    else:
-                        r = requests.post(backend_url, json={"message": prompt}, timeout=40)
-                        r.raise_for_status()
-                        data = r.json()
-                        resp = data.get("response", "")
-                        import json as _json2
-                        j = _json2.loads(resp)
-                        st.markdown(j.get("answer", resp))
-                        if j.get("items"):
-                            for it in j["items"]:
-                                if isinstance(it, dict) and "name" in it:
-                                    parts = it.get("parts_supplied", [])
-                                    parts_str = ", ".join(parts) if isinstance(parts, list) else str(parts)
-                                    st.markdown(f"- **{it.get('name','')}** — {it.get('contact_name','')} ({it.get('email','')}, {it.get('phone_number','')}) — Supplies: {parts_str}")
+                                        st.markdown(f"- **{it.get('name','')}** — {it.get('contact_name','')} ({it.get('email','')}, {it.get('phone_number','')}) — Supplies: {parts_str}")
+                                    else:
+                                        st.markdown(f"- {it}")
                                 else:
                                     st.markdown(f"- {it}")
-                        active_chat["messages"].append({"role": "assistant", "content": j.get("answer", resp)})
-                        active_chat["conversation_history"].append({"role": "user", "content": prompt})
-                        active_chat["conversation_history"].append({"role": "assistant", "content": resp})
-                        active_chat["updated_at"] = datetime.now().isoformat()
-                        _save_store()
+                        def _fmt(it):
+                            if isinstance(it, dict) and "name" in it:
+                                parts = it.get("parts_supplied", [])
+                                parts_str = ", ".join(parts) if isinstance(parts, list) else str(parts)
+                                return f"- {it.get('name','')} — {it.get('contact_name','')} ({it.get('email','')}) — Supplies: {parts_str}"
+                            return f"- {it}"
+                        active_chat["messages"].append({"role": "assistant", "content": answer + ("" if not items else "\n\n" + "\n".join(_fmt(x) for x in items))})
+                    except:
+                        clean = resp.strip()
+                        if clean.startswith("```"):
+                            clean = clean.strip("`").replace("json", "", 1).strip()
+                            try:
+                                j = _json.loads(clean)
+                                st.markdown(j.get("answer", clean))
+                                if j.get("items"):
+                                    for it in j["items"]:
+                                        if isinstance(it, dict) and "name" in it:
+                                            parts = it.get("parts_supplied", [])
+                                            parts_str = ", ".join(parts) if isinstance(parts, list) else str(parts)
+                                            st.markdown(f"- **{it.get('name','')}** — {it.get('contact_name','')} ({it.get('email','')}, {it.get('phone_number','')}) — Supplies: {parts_str}")
+                                        else:
+                                            st.markdown(f"- {it}")
+                                active_chat["messages"].append({"role": "assistant", "content": j.get("answer", clean)})
+                            except:
+                                st.markdown(clean)
+                                active_chat["messages"].append({"role": "assistant", "content": clean})
+                        else:
+                            st.markdown(clean)
+                            active_chat["messages"].append({"role": "assistant", "content": clean})
+                active_chat["updated_at"] = datetime.now().isoformat()
+                _save_store()
+            except requests.exceptions.ConnectionError:
+                err_msg = f"Backend unreachable at {BACKEND_URL}. Start `python backend/app.py` first. (PDF p3: Streamlit must call Flask `POST /chat`)"
+                st.error(err_msg)
+                active_chat["messages"].append({"role": "assistant", "content": err_msg})
+                active_chat["updated_at"] = datetime.now().isoformat()
+                _save_store()
             except Exception as e:
-                err_msg = f"Error: {str(e)[:300]}"
+                err_msg = f"Error: {str(e)[:400]}"
                 st.error(err_msg)
                 active_chat["messages"].append({"role": "assistant", "content": err_msg})
                 active_chat["updated_at"] = datetime.now().isoformat()
