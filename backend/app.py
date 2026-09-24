@@ -28,9 +28,32 @@ def chat():
         }), 400
 
     message = data["message"]
+    # Optional phase routing (PDF p3/p4): frontend sends phase="phase1" for rule-based, default phase2 LLM
+    phase = data.get("phase", "phase2")
+    # Allow frontend per-chat history (Streamlit multi-chat) to override session history
+    # Falls back to Flask session for PDF p3 follow-up example (How many brake pads? -> Where are they stored?)
+    req_history = data.get("history")
+    if isinstance(req_history, list):
+        history = req_history
+    else:
+        history = session.get("conversation_history", [])
 
-    history = session.get("conversation_history", [])
+    # Phase 1 — rule-based (no LLM) via same backend for PDF compliance (Streamlit pure HTTP)
+    if phase == "phase1" or str(phase).lower().startswith("phase 1"):
+        try:
+            from phase1.assistant_phase1 import handle_question as phase1_handle
+            response = phase1_handle(message)
+            # maintain history for phase1 as simple user+assistant pairs
+            history = history + [{"role": "user", "content": message}, {"role": "assistant", "content": response}]
+            session["conversation_history"] = history[-20:]
+            return jsonify({
+                "response": response,
+                "history": history
+            })
+        except Exception as e:
+            return jsonify({"error": str(e)}), 500
 
+    # Phase 2 — LLM with function calling via MCP
     response, history = _loop.run_until_complete(Chatbot(
         message,
         history
@@ -39,8 +62,14 @@ def chat():
     session["conversation_history"] = history
 
     return jsonify({
-        "response": response
+        "response": response,
+        "history": history
     })
+
+
+@app.route("/health", methods=["GET"])
+def health():
+    return jsonify({"status": "ok"}), 200
 
 
 @app.route("/inventory", methods=["GET", "POST"])
@@ -71,4 +100,6 @@ def inventory():
 
 
 if __name__ == "__main__":
-    app.run(host="127.0.0.1", port=5000, debug=False, use_reloader=False)
+    # Railway injects PORT, local defaults to 5000; bind 0.0.0.0 for container
+    port = int(os.getenv("PORT", "5000"))
+    app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False)
