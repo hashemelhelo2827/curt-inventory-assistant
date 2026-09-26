@@ -20,6 +20,6 @@ btns.html
 pagesource.html
 err_*.txt
 selenium_*.png
-# Railway proxy backup — local only, not pushed (PDF p3 proxy kept here)
+
 railway/
 railway_railway_backup/

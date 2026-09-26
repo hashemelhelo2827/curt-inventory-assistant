@@ -5,7 +5,6 @@ import asyncio
 import pandas as pd
 import uuid
 import json
-import time
 from datetime import datetime
 import streamlit.components.v1 as components
 
@@ -35,20 +34,7 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-# --- Auth stub (env STREAMLIT_PASSWORD, default off for local) ---
-if os.getenv("STREAMLIT_PASSWORD"):
-    if "authenticated" not in st.session_state:
-        st.session_state.authenticated = False
-    if not st.session_state.authenticated:
-        st.markdown("### 🔒 CURT Login")
-        pwd = st.text_input("Password", type="password", key="auth_pwd")
-        if st.button("Login"):
-            if pwd == os.getenv("STREAMLIT_PASSWORD"):
-                st.session_state.authenticated = True
-                st.rerun()
-            else:
-                st.error("Wrong password")
-        st.stop()
+
 
 # --- Design Taste: Custom CSS ---
 st.markdown("""
@@ -507,7 +493,6 @@ with st.sidebar:
             _save_store()
         st.rerun()
     
-    st.caption("Backend: Flask `POST /chat` + `GET /inventory` · LLM: Mistral nemo/tiny via `api.mistral.ai/v1` · DB: SQLite")
 
 # --- Top Bar with History Toggle ---
 st.markdown("<div style='height: 8px'></div>", unsafe_allow_html=True)
@@ -753,7 +738,3 @@ if prompt:
                 active_chat["messages"].append({"role": "assistant", "content": err_msg})
                 active_chat["updated_at"] = datetime.now().isoformat()
                 _save_store()
-
-# Footer
-st.divider()
-st.caption("CURT26-27 · Phase 1 rule-based + Phase 2 LLM (Mistral) · Toggle via sidebar · Inventory live from SQLite")
