@@ -72,6 +72,11 @@ def health():
     return jsonify({"status": "ok"}), 200
 
 
+@app.route("/health", methods=["GET"])
+def health():
+    return jsonify({"status": "ok"}), 200
+
+
 @app.route("/inventory", methods=["GET"])
 def inventory():
     
@@ -91,6 +96,4 @@ def inventory():
 
 
 if __name__ == "__main__":
-    # Railway injects PORT, local defaults to 5000; bind 0.0.0.0 for container
-    port = int(os.getenv("PORT", "5000"))
-    app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False)
+    app.run(host="127.0.0.1", port=5000, debug=False, use_reloader=False)
